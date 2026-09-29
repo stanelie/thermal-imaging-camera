@@ -293,7 +293,7 @@ int main() {
 
 #if PROFILE
     // give a host serial monitor time to attach before the boot markers go out
-    for (int i = 0; i < 20; i++) {
+    for (int i = 0; i < 8; i++) {
         printf("boot: waiting for host %d\n", i);
         sleep_ms(250);
     }
@@ -325,42 +325,6 @@ int main() {
     int patternMode = MLX90640_GetCurMode(MLX_I2C_ADDR);
     printf("boot: patternMode=%d, entering main loop\n", patternMode);
 
-#if PROFILE
-    // scan the I2C bus, checking the SDK return codes the MLX driver throws away
-    printf("diag: scanning I2C bus...\n");
-    int found = 0;
-    for (int addr = 0x08; addr < 0x78; addr++) {
-        uint8_t dummy;
-        int r = i2c_read_blocking(i2c0, addr, &dummy, 1, false);
-        if (r >= 0) {
-            printf("diag:   device responding at 0x%02x\n", addr);
-            found++;
-        }
-    }
-    printf("diag: scan done, %d device(s) found\n", found);
-
-    // and show what the raw SDK calls say for the MLX specifically
-    uint8_t cmd[2] = { MLX90640_STATUS_REG >> 8, MLX90640_STATUS_REG & 0xff };
-    int wr = i2c_write_blocking(i2c0, MLX_I2C_ADDR, cmd, 2, true);
-    uint8_t rx[2] = { 0, 0 };
-    int rd = i2c_read_blocking(i2c0, MLX_I2C_ADDR, rx, 2, false);
-    printf("diag: status reg: write->%d read->%d bytes=%02x%02x\n", wr, rd, rx[0], rx[1]);
-
-    // read the idle bus levels: both high means an idle bus with nothing answering,
-    // a low line means something is holding the bus down
-    gpio_set_function(16, GPIO_FUNC_SIO);
-    gpio_set_function(17, GPIO_FUNC_SIO);
-    gpio_set_dir(16, GPIO_IN);
-    gpio_set_dir(17, GPIO_IN);
-    gpio_pull_up(16);
-    gpio_pull_up(17);
-    sleep_ms(2);
-    printf("diag: with pullups   SDA(16)=%d SCL(17)=%d\n", gpio_get(16), gpio_get(17));
-    gpio_disable_pulls(16);
-    gpio_disable_pulls(17);
-    sleep_ms(2);
-    printf("diag: without pullups SDA(16)=%d SCL(17)=%d\n", gpio_get(16), gpio_get(17));
-#endif
 
     while (true) {
 

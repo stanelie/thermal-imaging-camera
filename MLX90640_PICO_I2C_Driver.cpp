@@ -20,10 +20,11 @@ extern "C"{
 #include <MLX90640_I2C_Driver.h>
 }
 
-// configure the Thermopile MLX90640 on the I2C bus 0 (SCL: 17, SDA: 16)
+// configure the Thermopile MLX90640 on the I2C bus 0 (SCL: 1, SDA: 0)
+// NOTE: GP0/GP1 are also UART0 TX/RX, so stdio over UART must stay disabled
 
-#define PIN_I2C_SDA 16
-#define PIN_I2C_SCL 17
+#define PIN_I2C_SDA 0
+#define PIN_I2C_SCL 1
 
 #define I2C_PORT i2c0
 

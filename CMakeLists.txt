@@ -38,7 +38,7 @@ pico_enable_stdio_usb(thermocam 1)
 
 # emit profiling output even when the host has not asserted DTR
 target_compile_definitions(thermocam PRIVATE PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1)
-pico_enable_stdio_uart(thermocam 1)
+pico_enable_stdio_uart(thermocam 0)   # GP0/GP1 are used for the MLX90640 I2C bus
 
 # create map/bin/hex/uf2 file in addition to ELF.
 pico_add_extra_outputs(thermocam)
