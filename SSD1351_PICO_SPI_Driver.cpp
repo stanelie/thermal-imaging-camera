@@ -30,7 +30,7 @@
 #define SPI_PORT spi1
 
 // SSD1351 datasheet allows a 150ns write cycle; raise with care and check for artifacts
-#define SSD1351_SPI_BAUD (10 * 1000 * 1000)
+#define SSD1351_SPI_BAUD (16 * 1000 * 1000)
 
 static int spi_dma_chan = -1;
 volatile uint32_t g_spi_baud = 0;

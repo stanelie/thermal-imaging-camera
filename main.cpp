@@ -349,6 +349,7 @@ int main() {
     uint16_t *captureFrame = new uint16_t[834];     // too large for allocating on stack 
     float *values = new float[MLX90640_PIXEL_NUM];  // too large for allocating on stack 
     int patternMode = MLX90640_GetCurMode(MLX_I2C_ADDR);
+    FrameDTO *dto = NULL;   // held across iterations so a skipped frame never loses it
     printf("boot: patternMode=%d, entering main loop\n", patternMode);
     {
         extern volatile uint32_t g_spi_baud, g_clk_peri, g_dma_pushes, g_pio_pushes;
@@ -368,10 +369,10 @@ int main() {
             p_window_start = now;
             const uint32_t n = 32;
             printf("%2lu fps | core0 wait=%5lu read=%5lu calc=%5lu scale=%4lu fifo=%5lu"
-                   " | core1 render=%5lu spi=%5lu | latency=%6lu = core0 %5lu + queue %5lu + core1 %5lu\n",
+                   " | core1 wait=%5lu render=%5lu spi=%5lu | lat=%6lu = %5lu + %5lu + %5lu\n",
                    (uint32_t)(32000000UL / (elapsed ? elapsed : 1)),
                    p_wait/n, p_read/n, p_calc/n, p_scale/n, p_fifo0/n,
-                   p_render/n, p_spi/n, p_latency/n, p_l1/n, p_l2/n, p_l3/n);
+                   p_fifo1/n, p_render/n, p_spi/n, p_latency/n, p_l1/n, p_l2/n, p_l3/n);
             p_loops = 0;
             p_wait = p_read = p_calc = p_scale = p_fifo0 = 0;
             p_fifo1 = p_render = p_text = p_spi = p_latency = 0;
@@ -381,10 +382,13 @@ int main() {
 
         // take a free buffer first: blocking here rather than after the capture
         // keeps the sensor read as late as possible, so the data handed over is
-        // as fresh as it can be
-        PROF_T(t_f0);
-        FrameDTO *dto = (FrameDTO*)multicore_fifo_pop_blocking();
-        PROF_ACC(p_fifo0, t_f0);
+        // as fresh as it can be. A frame skipped below keeps its buffer, since
+        // dropping one here would permanently shorten the pipeline.
+        if (dto == NULL) {
+            PROF_T(t_f0);
+            dto = (FrameDTO*)multicore_fifo_pop_blocking();
+            PROF_ACC(p_fifo0, t_f0);
+        }
 
         // wait until the MLX90640 has a new subpage ready. Polling here rather than
         // letting MLX90640_GetFrameData do it separates sensor slack from I2C cost.
@@ -442,6 +446,7 @@ int main() {
         PROF_ACC(p_scale, t_scale2);
         dto->t_push = time_us_32();
         multicore_fifo_push_blocking((uint32_t)dto);
+        dto = NULL;
         TRACE("pushed DTO to core1");
         if (p_trace > 0) p_trace--;
     }
