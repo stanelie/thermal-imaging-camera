@@ -35,6 +35,9 @@ pico_sdk_init()
 
 # Enable USB, UART output
 pico_enable_stdio_usb(thermocam 1)
+
+# emit profiling output even when the host has not asserted DTR
+target_compile_definitions(thermocam PRIVATE PICO_STDIO_USB_CONNECTION_WITHOUT_DTR=1)
 pico_enable_stdio_uart(thermocam 1)
 
 # create map/bin/hex/uf2 file in addition to ELF.
