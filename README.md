@@ -1,4 +1,4 @@
-# Fast (31 fps) MLX90640 Thermal Camera for the RP2040-Zero
+# Fast (32 fps) MLX90640 Thermal Camera for the RP2040-Zero
 
 A fast Thermal Imaging Camera using the MLX90640 sensor and a 1.5 inch RGB OLED Display Module.
 
@@ -59,8 +59,9 @@ Adding them took this camera from 26 to 31 fps and eliminated the errors entirel
 
 ## Features
 
-- **31 fps**, which is the MLX90640's own ceiling at a 32 Hz refresh rate — the
-  sensor delivers a subpage every 31.25 ms and the pipeline now keeps up with it
+- **32 fps** — the MLX90640's own ceiling at a 32 Hz refresh rate. The sensor
+  delivers a subpage every 31.25 ms and the pipeline now keeps up with it, so the
+  camera is paced by the sensor rather than by its own work
 - **53 ms** end-to-end latency, sensor-ready to pixels lit
 - **82 ms** boot to first frame
 - both cores of the RP2040 in a pipeline:
@@ -86,7 +87,7 @@ Beyond the pin remapping and pull-ups above:
 | Touch buttons removed | the pins are unwired here; left floating with edge interrupts they trip at random |
 
 Upstream's own measurements were 23 fps on a Pico; the 21 fps baseline this fork
-started from was measured on this hardware.
+started from was measured on this hardware, as were all the figures above.
 
 Why single precision: upstream calls the Melexis driver's `MLX90640_CalculateTo`,
 which is written against double literals (`SCALEALPHA` is `0.000001`, the Kelvin
