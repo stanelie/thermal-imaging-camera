@@ -24,7 +24,7 @@ extern "C"{
 #include <MLX90640_API.h>
 }
 
-#include "SSD1351_SPI_Driver.h"
+#include "SSD1351_SPI_DRIVER.h"
 #include "SSD1351_API.h"
 
 // ---- configuration ----
@@ -40,6 +40,22 @@ constexpr bool BILINEAR_INTERPOLATION = true;   // if true use bilinear interpol
 
 #define FLIP_GRAPH_HORIZONTAL 1
 #define FLIP_GRAPH_VERTICAL 0
+
+// ---- profiling ----
+
+#define PROFILE 1
+
+#if PROFILE
+// per-stage microsecond accumulators, summed over a 1 second window
+static volatile uint32_t p_wait, p_read, p_calc, p_scale, p_fifo0;  // core0 stages
+static volatile uint32_t p_render, p_text, p_spi, p_fifo1;          // core1 stages
+static volatile bool p_report = false;
+#define PROF_T(v)        uint32_t v = time_us_32()
+#define PROF_ACC(acc, v) acc += time_us_32() - (v)
+#else
+#define PROF_T(v)        do {} while (0)
+#define PROF_ACC(acc, v) do {} while (0)
+#endif
 
 // ---- other constants (don't change) ----
 
@@ -85,6 +101,9 @@ bool timer_callback(repeating_timer_t *rt)
 {   
     fps = frame_cnt;
     frame_cnt = 0;
+#if PROFILE
+    p_report = true;
+#endif
     return true;
 }
 
@@ -179,7 +198,11 @@ void renderer() {
     while (true) {
 
         // wait for a frame DTO received from core0
+        PROF_T(t_f1);
         FrameDTO *dto = (FrameDTO*) multicore_fifo_pop_blocking();
+        PROF_ACC(p_fifo1, t_f1);
+
+        PROF_T(t_render);
 
         if (freeze_image) {
             // just send back the DTO without rendering it
@@ -223,11 +246,15 @@ void renderer() {
             }
         }
 
+        PROF_ACC(p_render, t_render);
+
         float min = dto->min;
         float max = dto->max;
 
         // send frame back to core0
         multicore_fifo_push_blocking((uint32_t)dto);
+
+        PROF_T(t_text);
 
         int y = GRAPH_HEIGHT;
         SSD1351_fillrect(0, y, DISPLAY_WIDTH, 16, BLACK);
@@ -245,7 +272,11 @@ void renderer() {
         w = SSD1351_textwidth(buf);
         SSD1351_text(DISPLAY_WIDTH-w-1, y, buf, WHITE);
 
+        PROF_ACC(p_text, t_text);
+
+        PROF_T(t_spi);
         SSD1351_update();
+        PROF_ACC(p_spi, t_spi);
 
         frame_cnt++;
     }
@@ -276,18 +307,47 @@ int main() {
 
     while (true) {
 
+#if PROFILE
+        if (p_report) {
+            p_report = false;
+            int n = fps > 0 ? fps : 1;
+            printf("fps=%2d | core0 wait=%5lu read=%5lu calc=%5lu scale=%4lu fifo=%5lu"
+                   " | core1 fifo=%5lu render=%5lu text=%4lu spi=%5lu  (us/frame)\n",
+                   fps, p_wait/n, p_read/n, p_calc/n, p_scale/n, p_fifo0/n,
+                   p_fifo1/n, p_render/n, p_text/n, p_spi/n);
+            p_wait = p_read = p_calc = p_scale = p_fifo0 = 0;
+            p_fifo1 = p_render = p_text = p_spi = 0;
+        }
+#endif
+
+        // wait until the MLX90640 has a new subpage ready. Polling here rather than
+        // letting MLX90640_GetFrameData do it separates sensor slack from I2C cost.
+        PROF_T(t_wait);
+        uint16_t statusReg = 0;
+        while (!MLX90640_GET_DATA_READY(statusReg)) {
+            if (MLX90640_I2CRead(MLX_I2C_ADDR, MLX90640_STATUS_REG, 1, &statusReg) != 0) {
+                break;
+            }
+        }
+        PROF_ACC(p_wait, t_wait);
+
         // read pages (half frames) from the MLX90640
+        PROF_T(t_read);
         int status = MLX90640_GetFrameData(MLX_I2C_ADDR, captureFrame);
+        PROF_ACC(p_read, t_read);
         if (status < 0) {
             printf("Error: MLX90640_GetFrameData returned %d\n", status);
             continue;   // skip this frame
         }
+        PROF_T(t_calc);
         float eTa = MLX90640_GetTa(captureFrame, params) + OPENAIR_TA_SHIFT;
         MLX90640_CalculateTo(captureFrame, params, EMISSIVITY, eTa, values);
         MLX90640_BadPixelsCorrection(params->brokenPixels, values, patternMode, params);
         MLX90640_BadPixelsCorrection(params->outlierPixels, values, patternMode, params);
+        PROF_ACC(p_calc, t_calc);
 
         // find min and max temperature values of the frame
+        PROF_T(t_scale);
         float min, max;
         min = max = values[0];
         for (int i = 1; i < MLX90640_PIXEL_NUM; i++) {
@@ -298,15 +358,21 @@ int main() {
                 min = value;
         }
 
+        PROF_ACC(p_scale, t_scale);
+
         // create a DTO for the renderer
+        PROF_T(t_f0);
         FrameDTO *dto = (FrameDTO*)multicore_fifo_pop_blocking();
+        PROF_ACC(p_fifo0, t_f0);
         dto->min = min;
         dto->max = max;
 
+        PROF_T(t_scale2);
         float step = (ceil(max + 1.0) - floor(min - 1.0)) / float(HEAT_MAP_SIZE-1);
         for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
             dto->values[i] = uint8_t((values[i] - min) / step);
         }
+        PROF_ACC(p_scale, t_scale2);
         multicore_fifo_push_blocking((uint32_t)dto);
     }
 

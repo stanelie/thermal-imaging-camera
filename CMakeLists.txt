@@ -34,7 +34,7 @@ target_link_libraries(thermocam
 pico_sdk_init()
 
 # Enable USB, UART output
-pico_enable_stdio_usb(thermocam 0)
+pico_enable_stdio_usb(thermocam 1)
 pico_enable_stdio_uart(thermocam 1)
 
 # create map/bin/hex/uf2 file in addition to ELF.
