@@ -1,4 +1,4 @@
-# Fast (32 fps) MLX90640 Thermal Camera for the RP2040-Zero
+# Fast (about 32 fps) MLX90640 Thermal Camera for the RP2040-Zero
 
 A fast Thermal Imaging Camera using the MLX90640 sensor and a 1.5 inch RGB OLED Display Module.
 
@@ -59,7 +59,7 @@ Adding them took this camera from 26 to 31 fps and eliminated the errors entirel
 
 ## Features
 
-- **32 fps** — the MLX90640's own ceiling at a 32 Hz refresh rate. The sensor
+- **about 32 fps** — the MLX90640's own ceiling at a 32 Hz refresh rate. The sensor
   delivers a subpage every 31.25 ms and the pipeline now keeps up with it, so the
   camera is paced by the sensor rather than by its own work
 - **53 ms** end-to-end latency, sensor-ready to pixels lit
