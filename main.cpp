@@ -38,7 +38,6 @@ constexpr float OPENAIR_TA_SHIFT = -8.0;        // for a MLX90640 in the open ai
 
 // SSD1351 128 x 128 OLED Display
 constexpr uint16_t HEAT_MAP_SIZE = 256;         // the number of colors in the heat map (must be <= 256)
-constexpr bool BILINEAR_INTERPOLATION = true;   // if true use bilinear interpolation and nearest neighbor interpolation otherwise
 
 #define FLIP_GRAPH_HORIZONTAL 0
 #define FLIP_GRAPH_VERTICAL 1
@@ -179,19 +178,6 @@ void heatmap_init() {
 #define TR_Y(y) (y)
 #endif
 
-// fill a rectangle in graph coordinates, applying the flips to the whole rect.
-// Passing a flipped origin straight to SSD1351_fillrect would shift the block by
-// its own width and run past the right edge of the framebuffer.
-static inline void graph_fillrect(int x, int y, int w, int h, uint16_t color) {
-#if FLIP_GRAPH_HORIZONTAL
-    x = GRAPH_WIDTH - x - w;
-#endif
-#if FLIP_GRAPH_VERTICAL
-    y = GRAPH_HEIGHT - y - h;
-#endif
-    SSD1351_fillrect(x, IMAGE_TOP + y, w, h, color);
-}
-
 typedef struct {
     uint32_t t_ready;                   // time_us_32() when the sensor flagged this subpage ready
     uint32_t t_push;                    // time_us_32() when core0 handed it over
@@ -236,40 +222,27 @@ void renderer() {
         const uint32_t frame_t_push = dto->t_push;
 #endif
 
-        if constexpr (BILINEAR_INTERPOLATION) {
-            // integer bilinear interpolation off the precomputed tables
-            for (int y = 0; y < GRAPH_HEIGHT; y++) {
+        // integer bilinear interpolation off the precomputed tables
+        for (int y = 0; y < GRAPH_HEIGHT; y++) {
 
-                const int32_t y0 = ipy0[y];
-                const int32_t ty = ipyf[y];
-                const uint8_t *row0 = &dto->values[y0 << 5];
-                const uint8_t *row1 = row0 + MLX90640_COLUMN_NUM;
+            const int32_t y0 = ipy0[y];
+            const int32_t ty = ipyf[y];
+            const uint8_t *row0 = &dto->values[y0 << 5];
+            const uint8_t *row1 = row0 + MLX90640_COLUMN_NUM;
 
-                for (int x = 0; x < GRAPH_WIDTH; x++) {
+            for (int x = 0; x < GRAPH_WIDTH; x++) {
 
-                    const int32_t x0 = ipx0[x];
-                    const int32_t tx = ipxf[x];
+                const int32_t x0 = ipx0[x];
+                const int32_t tx = ipxf[x];
 
-                    int32_t v00 = row0[x0], v10 = row0[x0+1];
-                    int32_t v01 = row1[x0], v11 = row1[x0+1];
+                int32_t v00 = row0[x0], v10 = row0[x0+1];
+                int32_t v01 = row1[x0], v11 = row1[x0+1];
 
-                    int32_t s = v00 + ((tx * (v10-v00)) >> 8);
-                    int32_t e = v01 + ((tx * (v11-v01)) >> 8);
-                    int32_t v = s + ((ty * (e-s)) >> 8);
+                int32_t s = v00 + ((tx * (v10-v00)) >> 8);
+                int32_t e = v01 + ((tx * (v11-v01)) >> 8);
+                int32_t v = s + ((ty * (e-s)) >> 8);
 
-                    SSD1351_pixel(TR_X(x), IMAGE_TOP + TR_Y(y), palette[v]);
-                }
-            }
-        } else {
-            // nearest neighbor: each sensor pixel fills its own block of the graph
-            for (int y = 0; y < MLX90640_LINE_NUM; y++) {
-                int y_top = (y * GRAPH_HEIGHT) / MLX90640_LINE_NUM;
-                int h = ((y + 1) * GRAPH_HEIGHT) / MLX90640_LINE_NUM - y_top;
-                for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
-                    int x_lft = (x * GRAPH_WIDTH) / MLX90640_COLUMN_NUM;
-                    int w = ((x + 1) * GRAPH_WIDTH) / MLX90640_COLUMN_NUM - x_lft;
-                    graph_fillrect(x_lft, y_top, w, h, palette[dto->value(x, y)]);
-                }
+                SSD1351_pixel(TR_X(x), IMAGE_TOP + TR_Y(y), palette[v]);
             }
         }
 
