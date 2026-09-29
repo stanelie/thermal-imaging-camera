@@ -55,6 +55,8 @@ static volatile uint32_t p_render, p_text, p_spi, p_fifo1;          // core1 sta
 static volatile bool p_report = false;
 static uint32_t p_loops = 0;
 static uint32_t p_window_start = 0;
+static volatile uint32_t p_latency = 0;   // sensor-ready to pixels-on-screen
+static volatile uint32_t p_l1 = 0, p_l2 = 0, p_l3 = 0;  // core0 / queue / core1 shares
 static int p_trace = 3;     // trace the first few iterations stage by stage
 #define TRACE(msg) do { if (p_trace > 0) printf("  trace: " msg "\n"); } while (0)
 #define PROF_T(v)        uint32_t v = time_us_32()
@@ -97,31 +99,6 @@ static void interp_tables_init() {
 }
 
 // ---- implementation ----
-
-// handle touch button interrupts
-static bool bilinear_interpolation = BILINEAR_INTERPOLATION;
-static bool freeze_image = false;
-
-void gpio_callback(uint gpio, uint32_t events) {
-    switch (gpio) {
-        case 14:    // touch button disables bilinear interpolation
-            if (events & GPIO_IRQ_EDGE_RISE) {
-                bilinear_interpolation = false;
-            }
-            if (events & GPIO_IRQ_EDGE_FALL) {
-                bilinear_interpolation = true;
-            }
-            break;
-        case 18:   // touch button "freeze image"
-            if (events & GPIO_IRQ_EDGE_RISE) {
-                freeze_image = true;
-            }
-            if (events & GPIO_IRQ_EDGE_FALL) {
-                freeze_image = false;
-            }
-            break;
-    }
-}
 
 // measure display frame rate with a timer interrupt
 static repeating_timer_t timer;
@@ -213,6 +190,8 @@ static inline void graph_fillrect(int x, int y, int w, int h, uint16_t color) {
 }
 
 typedef struct {
+    uint32_t t_ready;                   // time_us_32() when the sensor flagged this subpage ready
+    uint32_t t_push;                    // time_us_32() when core0 handed it over
     float min, max;                     // min and max temperature values
     uint8_t values[MLX90640_PIXEL_NUM]; // temperature values from [min .. max] scaled to [0 .. HEAT_MAP_SIZE-1]
 
@@ -230,12 +209,11 @@ void renderer() {
 
     add_repeating_timer_ms(1000, &timer_callback, NULL, &timer);
 
-    gpio_set_irq_enabled(14, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    gpio_set_irq_enabled(18, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL, true);
-    gpio_set_irq_callback(&gpio_callback);
-    irq_set_enabled(IO_IRQ_BANK0, true);
-
-    // create a single DTO for the communication between main thread (core0) and renderer thread (core1)
+    // Two frame buffers. Core0 fills one while core1 renders the other, and a
+    // buffer is not released until its frame has actually been pushed to the
+    // display: releasing it earlier lets core0 run ahead and read the sensor
+    // sooner than needed, which only makes the displayed frame staler.
+    multicore_fifo_push_blocking((uint32_t)new FrameDTO());
     multicore_fifo_push_blocking((uint32_t)new FrameDTO());
 
     // process DTOs received from core0
@@ -247,14 +225,13 @@ void renderer() {
         PROF_ACC(p_fifo1, t_f1);
 
         PROF_T(t_render);
+#if PROFILE
+        const uint32_t t_pop = time_us_32();
+        const uint32_t frame_t_ready = dto->t_ready;
+        const uint32_t frame_t_push = dto->t_push;
+#endif
 
-        if (freeze_image) {
-            // just send back the DTO without rendering it
-            multicore_fifo_push_blocking((uint32_t)dto);
-            continue;
-        }
-
-        if (bilinear_interpolation) {
+        if constexpr (BILINEAR_INTERPOLATION) {
             // integer bilinear interpolation off the precomputed tables
             for (int y = 0; y < GRAPH_HEIGHT; y++) {
 
@@ -296,9 +273,6 @@ void renderer() {
         float min = dto->min;
         float max = dto->max;
 
-        // send frame back to core0
-        multicore_fifo_push_blocking((uint32_t)dto);
-
         PROF_T(t_text);
 
         int y = GRAPH_HEIGHT;
@@ -322,6 +296,18 @@ void renderer() {
         PROF_T(t_spi);
         SSD1351_update();
         PROF_ACC(p_spi, t_spi);
+
+        // the frame is on the display now, so this buffer can be refilled
+        multicore_fifo_push_blocking((uint32_t)dto);
+#if PROFILE
+        {
+            const uint32_t now = time_us_32();
+            p_l1 += frame_t_push - frame_t_ready;
+            p_l2 += t_pop - frame_t_push;
+            p_l3 += now - t_pop;
+            p_latency += now - frame_t_ready;
+        }
+#endif
 
         frame_cnt++;
     }
@@ -382,15 +368,23 @@ int main() {
             p_window_start = now;
             const uint32_t n = 32;
             printf("%2lu fps | core0 wait=%5lu read=%5lu calc=%5lu scale=%4lu fifo=%5lu"
-                   " | core1 fifo=%5lu render=%5lu text=%4lu spi=%5lu  (us/frame)\n",
+                   " | core1 render=%5lu spi=%5lu | latency=%6lu = core0 %5lu + queue %5lu + core1 %5lu\n",
                    (uint32_t)(32000000UL / (elapsed ? elapsed : 1)),
                    p_wait/n, p_read/n, p_calc/n, p_scale/n, p_fifo0/n,
-                   p_fifo1/n, p_render/n, p_text/n, p_spi/n);
+                   p_render/n, p_spi/n, p_latency/n, p_l1/n, p_l2/n, p_l3/n);
             p_loops = 0;
             p_wait = p_read = p_calc = p_scale = p_fifo0 = 0;
-            p_fifo1 = p_render = p_text = p_spi = 0;
+            p_fifo1 = p_render = p_text = p_spi = p_latency = 0;
+            p_l1 = p_l2 = p_l3 = 0;
         }
 #endif
+
+        // take a free buffer first: blocking here rather than after the capture
+        // keeps the sensor read as late as possible, so the data handed over is
+        // as fresh as it can be
+        PROF_T(t_f0);
+        FrameDTO *dto = (FrameDTO*)multicore_fifo_pop_blocking();
+        PROF_ACC(p_fifo0, t_f0);
 
         // wait until the MLX90640 has a new subpage ready. Polling here rather than
         // letting MLX90640_GetFrameData do it separates sensor slack from I2C cost.
@@ -402,6 +396,7 @@ int main() {
             }
         }
         PROF_ACC(p_wait, t_wait);
+        const uint32_t t_ready = time_us_32();
         TRACE("sensor data ready");
 
         // read pages (half frames) from the MLX90640
@@ -435,11 +430,7 @@ int main() {
 
         PROF_ACC(p_scale, t_scale);
 
-        // create a DTO for the renderer
-        PROF_T(t_f0);
-        FrameDTO *dto = (FrameDTO*)multicore_fifo_pop_blocking();
-        PROF_ACC(p_fifo0, t_f0);
-        TRACE("got DTO from core1");
+        dto->t_ready = t_ready;
         dto->min = min;
         dto->max = max;
 
@@ -449,6 +440,7 @@ int main() {
             dto->values[i] = uint8_t((values[i] - min) / step);
         }
         PROF_ACC(p_scale, t_scale2);
+        dto->t_push = time_us_32();
         multicore_fifo_push_blocking((uint32_t)dto);
         TRACE("pushed DTO to core1");
         if (p_trace > 0) p_trace--;
