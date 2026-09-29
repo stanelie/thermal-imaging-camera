@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include <cstdio>
+#include <string.h>
 #include <math.h>
 #include <pico/stdlib.h>
 #include "pico/multicore.h"
@@ -38,6 +39,9 @@ constexpr float OPENAIR_TA_SHIFT = -8.0;        // for a MLX90640 in the open ai
 
 // SSD1351 128 x 128 OLED Display
 constexpr uint16_t HEAT_MAP_SIZE = 256;         // the number of colors in the heat map (must be <= 256)
+
+// temporal average over this many frames, to damp sensor noise. 1 disables it.
+constexpr int SMOOTH_FRAMES = 1;
 
 #define FLIP_GRAPH_HORIZONTAL 0
 #define FLIP_GRAPH_VERTICAL 1
@@ -222,12 +226,44 @@ void renderer() {
         const uint32_t frame_t_push = dto->t_push;
 #endif
 
+        // Average the palette indices over the last few frames. The MLX90640 is
+        // noisy enough per-frame that this reads as a clear improvement, and core1
+        // has the idle time for it. Costs roughly one frame of extra motion lag.
+        const uint8_t *src = dto->values;
+        if constexpr (SMOOTH_FRAMES > 1) {
+            static uint8_t hist[SMOOTH_FRAMES][MLX90640_PIXEL_NUM];
+            static uint8_t smoothed[MLX90640_PIXEL_NUM];
+            static int hist_pos = 0;
+            static bool hist_primed = false;
+
+            if (!hist_primed) {
+                // seed every slot from the first frame, so the divisor below is
+                // always the constant SMOOTH_FRAMES and never a runtime divide
+                for (int f = 0; f < SMOOTH_FRAMES; f++) {
+                    memcpy(hist[f], dto->values, MLX90640_PIXEL_NUM);
+                }
+                hist_primed = true;
+            } else {
+                memcpy(hist[hist_pos], dto->values, MLX90640_PIXEL_NUM);
+                hist_pos = (hist_pos + 1) % SMOOTH_FRAMES;
+            }
+
+            for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+                unsigned sum = 0;
+                for (int f = 0; f < SMOOTH_FRAMES; f++) {
+                    sum += hist[f][i];
+                }
+                smoothed[i] = (uint8_t)(sum / SMOOTH_FRAMES);
+            }
+            src = smoothed;
+        }
+
         // integer bilinear interpolation off the precomputed tables
         for (int y = 0; y < GRAPH_HEIGHT; y++) {
 
             const int32_t y0 = ipy0[y];
             const int32_t ty = ipyf[y];
-            const uint8_t *row0 = &dto->values[y0 << 5];
+            const uint8_t *row0 = &src[y0 << 5];
             const uint8_t *row1 = row0 + MLX90640_COLUMN_NUM;
 
             for (int x = 0; x < GRAPH_WIDTH; x++) {
