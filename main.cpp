@@ -23,6 +23,8 @@
 extern "C"{
 #include <MLX90640_I2C_Driver.h>
 #include <MLX90640_API.h>
+void MLX90640_CalculateTo_fast(uint16_t *frameData, const paramsMLX90640 *params,
+                               float emissivity, float tr, float *result);
 }
 
 #include "SSD1351_SPI_DRIVER.h"
@@ -324,6 +326,11 @@ int main() {
     float *values = new float[MLX90640_PIXEL_NUM];  // too large for allocating on stack 
     int patternMode = MLX90640_GetCurMode(MLX_I2C_ADDR);
     printf("boot: patternMode=%d, entering main loop\n", patternMode);
+    {
+        extern volatile uint32_t g_spi_baud, g_clk_peri, g_dma_pushes, g_pio_pushes;
+        printf("boot: clk_peri=%lu Hz, spi baud=%lu Hz, dma_pushes=%lu blocking_pushes=%lu\n",
+               g_clk_peri, g_spi_baud, g_dma_pushes, g_pio_pushes);
+    }
 
 
     while (true) {
@@ -370,7 +377,7 @@ int main() {
         }
         PROF_T(t_calc);
         float eTa = MLX90640_GetTa(captureFrame, params) + OPENAIR_TA_SHIFT;
-        MLX90640_CalculateTo(captureFrame, params, EMISSIVITY, eTa, values);
+        MLX90640_CalculateTo_fast(captureFrame, params, EMISSIVITY, eTa, values);
         MLX90640_BadPixelsCorrection(params->brokenPixels, values, patternMode, params);
         MLX90640_BadPixelsCorrection(params->outlierPixels, values, patternMode, params);
         PROF_ACC(p_calc, t_calc);

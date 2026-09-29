@@ -15,6 +15,7 @@ add_executable(thermocam
     ./mlx90640-library/functions/MLX90640_API.c
     SSD1351_PICO_SPI_Driver.cpp
     SSD1351_API.cpp
+    MLX90640_fast.cpp
 )
 
 target_include_directories(thermocam PUBLIC
@@ -26,6 +27,7 @@ target_link_libraries(thermocam
     pico_stdlib
     hardware_i2c
     hardware_spi
+    hardware_dma
     hardware_gpio
     pico_multicore
 )
