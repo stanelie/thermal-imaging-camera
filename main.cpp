@@ -40,8 +40,8 @@ constexpr float OPENAIR_TA_SHIFT = -8.0;        // for a MLX90640 in the open ai
 constexpr uint16_t HEAT_MAP_SIZE = 256;         // the number of colors in the heat map (must be <= 256)
 constexpr bool BILINEAR_INTERPOLATION = true;   // if true use bilinear interpolation and nearest neighbor interpolation otherwise
 
-#define FLIP_GRAPH_HORIZONTAL 1
-#define FLIP_GRAPH_VERTICAL 0
+#define FLIP_GRAPH_HORIZONTAL 0
+#define FLIP_GRAPH_VERTICAL 1
 
 // ---- profiling ----
 
