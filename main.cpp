@@ -71,6 +71,7 @@ static int p_trace = 3;     // trace the first few iterations stage by stage
 constexpr uint8_t MLX_I2C_ADDR = 0x33;          // I2C address of the MLX90640
 
 constexpr uint16_t BANNER_HEIGHT = 16;                                  // bottom strip holding min / fps / max
+constexpr uint32_t BANNER_INTERVAL_US = 350000;                         // ~3 banner refreshes a second
 constexpr uint16_t GRAPH_WIDTH = DISPLAY_WIDTH;                         // width of the thermal camera graph on the OLED display
 constexpr uint16_t GRAPH_HEIGHT = DISPLAY_HEIGHT - BANNER_HEIGHT;       // height of the thermal camera graph on the OLED display
 
@@ -275,26 +276,35 @@ void renderer() {
 
         PROF_T(t_text);
 
-        int y = GRAPH_HEIGHT;
-        SSD1351_fillrect(0, y, DISPLAY_WIDTH, 16, BLACK);
+        // the banner is only readable at a few updates a second, so redrawing and
+        // re-sending it every frame would spend ~2.5ms of SPI on nothing
+        static uint32_t banner_due = 0;
+        const uint32_t now_us = time_us_32();
+        const bool banner_dirty = (int32_t)(now_us - banner_due) >= 0;
+        if (banner_dirty) {
+            banner_due = now_us + BANNER_INTERVAL_US;
 
-        y += 4;
-        char buf[32];
-        sprintf(buf, "%.0f", min);
-        SSD1351_text(1, y, buf, WHITE);
+            int y = GRAPH_HEIGHT;
+            SSD1351_fillrect(0, y, DISPLAY_WIDTH, BANNER_HEIGHT, BLACK);
 
-        sprintf(buf, "%d fps", fps);
-        int w = SSD1351_textwidth(buf);
-        SSD1351_text((DISPLAY_WIDTH-w) / 2, y, buf, WHITE);
+            y += 4;
+            char buf[32];
+            sprintf(buf, "%.0f", min);
+            SSD1351_text(1, y, buf, WHITE);
 
-        sprintf(buf, "%.0f", max);
-        w = SSD1351_textwidth(buf);
-        SSD1351_text(DISPLAY_WIDTH-w-1, y, buf, WHITE);
+            sprintf(buf, "%d fps", fps);
+            int w = SSD1351_textwidth(buf);
+            SSD1351_text((DISPLAY_WIDTH-w) / 2, y, buf, WHITE);
+
+            sprintf(buf, "%.0f", max);
+            w = SSD1351_textwidth(buf);
+            SSD1351_text(DISPLAY_WIDTH-w-1, y, buf, WHITE);
+        }
 
         PROF_ACC(p_text, t_text);
 
         PROF_T(t_spi);
-        SSD1351_update();
+        SSD1351_update_rows(0, banner_dirty ? DISPLAY_HEIGHT - 1 : GRAPH_HEIGHT - 1);
         PROF_ACC(p_spi, t_spi);
 
         // the frame is on the display now, so this buffer can be refilled

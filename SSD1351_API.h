@@ -35,6 +35,7 @@ int SSD1351_charwidth(int8_t c);
 int SSD1351_text(int16_t x, int16_t y, char *s, uint16_t color);
 int SSD1351_textwidth(char *s);
 void SSD1351_update(void);
+void SSD1351_update_rows(uint8_t y0, uint8_t y1);
 uint16_t SSD1351_color(uint8_t r, uint8_t g, uint8_t b);
 
 #endif

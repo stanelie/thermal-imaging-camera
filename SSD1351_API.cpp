@@ -370,11 +370,19 @@ int SSD1351_textwidth(char *s) {
     return x;
 }
 
+void SSD1351_update_rows(uint8_t y0, uint8_t y1)
+{
+    char rows[2] = { (char)y0, (char)y1 };
+    SSD1351_write_command(SSD1351_CMD_SETCOLUMN, "\x00\x7F", 2);
+    SSD1351_write_command(SSD1351_CMD_SETROW, rows, 2);
+    SSD1351_write_command(SSD1351_CMD_WRITERAM,
+                          (const char*) &displayRAM.byte[y0 * DISPLAY_WIDTH * 2],
+                          (y1 - y0 + 1) * DISPLAY_WIDTH * 2);
+}
+
 void SSD1351_update(void)
 {
-    SSD1351_write_command(SSD1351_CMD_SETCOLUMN, "\x00\x7F", 2);
-    SSD1351_write_command(SSD1351_CMD_SETROW, "\x00\x7F", 2);
-    SSD1351_write_command(SSD1351_CMD_WRITERAM, (const char*) displayRAM.byte, DRAM_SIZE_8);
+    SSD1351_update_rows(0, DISPLAY_HEIGHT - 1);
 }
 
 uint16_t SSD1351_color(uint8_t r, uint8_t g, uint8_t b) {
