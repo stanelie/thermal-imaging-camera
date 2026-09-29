@@ -2,8 +2,6 @@
 
 A fast Thermal Imaging Camera using the MLX90640 sensor and a 1.5 inch RGB OLED Display Module.
 
-![breadboard setup showing thermal image of a candle](images/movie.gif)
-
 > **This is a fork.** The original project is
 > **[weinand/thermal-imaging-camera](https://github.com/weinand/thermal-imaging-camera)**
 > by **André Weinand**, who designed the two-core pipeline, the integer bilinear
@@ -120,9 +118,3 @@ to the RPI-RP2 drive, or with `picotool load -x build/thermocam.uf2`.
 
 `PROFILE` in `main.cpp` (on by default) prints per-stage timings over USB serial
 once a second, which is how every number above was measured.
-
-## More images
-
-![breadboard setup showing thermal image of a candle](images/photo_1.jpg)
-
-![close-up of OLED display showing camera](images/photo_2.jpg)
