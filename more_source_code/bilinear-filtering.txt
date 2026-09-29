@@ -1,0 +1,26 @@
+    ////                 Bilinear interpolation
+            //int32_t mx = ((MLX90640_COLUMN_NUM - 1) << 7) / GRAPH_WIDTH;
+            //int32_t my = ((MLX90640_LINE_NUM - 1) << 7) / GRAPH_HEIGHT;
+            
+            //for (int y = 0; y < GRAPH_HEIGHT; y++) {
+                
+                //int32_t y0 = (y * my) >> 7;
+                //int32_t ty = (y * my) & 0x7f;
+ 
+                //for (int x = 0; x < GRAPH_WIDTH; x++) {
+
+                    //int32_t x0 = (x * mx) >> 7;
+                    //int32_t tx = (x * mx) & 0x7f;
+
+                    //int16_t v00 = dto->value(x0,   y0);
+                    //int16_t v10 = dto->value(x0+1, y0);
+                    //int16_t v01 = dto->value(x0,   y0+1);
+                    //int16_t v11 = dto->value(x0+1, y0+1);
+
+                    //int32_t s = v00 + ((tx * (v10-v00)) >> 7);
+                    //int32_t e = v01 + ((tx * (v11-v01)) >> 7);
+                    //int32_t v = s + ((ty * (e-s)) >> 7);
+          
+                    //SSD1351_pixel(TR_X(x), TR_Y(y), palette[v]);
+                //}
+            //}

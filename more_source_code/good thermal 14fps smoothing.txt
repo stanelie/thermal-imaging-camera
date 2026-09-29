@@ -1,0 +1,377 @@
+/**
+ * Copyright 2023 André Weinand
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <cstdio>
+#include <ctime>
+#include <math.h>
+#include <pico/stdlib.h>
+#include "pico/multicore.h"
+#include <string.h>
+
+extern "C"{
+#include <MLX90640_I2C_Driver.h>
+#include <MLX90640_API.h>
+}
+
+#include "SSD1351_SPI_DRIVER.h"
+#include "SSD1351_API.h"
+
+// ---- configuration ----
+
+// MLX90640 32 x 24 Thermopile Array
+constexpr uint8_t REFRESH_RATE = 5;      // 0: 0.5 Hz, 1: 1 Hz, 2: 2 Hz, 3: 4 Hz, 4: 8 Hz, 5: 16 Hz, 6: 32 Hz, 7: 64 Hz
+constexpr float EMISSIVITY = 0.95;       // the emissivity of the measured object (1.0 = black body)
+constexpr float OPENAIR_TA_SHIFT = -8.0; // for a MLX90640 in the open air the shift is -8 deg Celsius
+
+// SSD1351 128 x 128 OLED Display
+constexpr uint16_t HEAT_MAP_SIZE = 256;  // the number of colors in the heat map (must be <= 256)
+
+#define FLIP_GRAPH_HORIZONTAL 1
+#define FLIP_GRAPH_VERTICAL 0
+#define NUM_FRAMES 3
+
+// --- Static buffers to store previous frames ---
+// Changed to uint8_t to store palette indices directly
+static uint8_t frame_buffers[NUM_FRAMES][MLX90640_LINE_NUM][MLX90640_COLUMN_NUM];
+// --- Static counter to track how many frames we've processed ---
+static int frame_count = 0;
+
+// ---- other constants (don't change) ----
+
+constexpr uint8_t MLX_I2C_ADDR = 0x33;     // I2C address of the MLX90640
+
+// Define the height of the banner area at the bottom of the display
+constexpr uint16_t BANNER_HEIGHT = 16; // Adjust this value as needed for your text
+
+// Adjust GRAPH_HEIGHT to reserve space for the banner
+constexpr uint16_t GRAPH_HEIGHT = DISPLAY_HEIGHT - BANNER_HEIGHT;
+constexpr uint16_t GRAPH_WIDTH = DISPLAY_WIDTH;
+
+// Scaling factors for the thermal image, now considering the reduced GRAPH_HEIGHT
+// These are kept for conceptual understanding but integer math will use pre-calculated ratios.
+// constexpr float SCALING_FACTOR_X = (float)GRAPH_WIDTH / MLX90640_COLUMN_NUM;
+// constexpr float SCALING_FACTOR_Y = (float)GRAPH_HEIGHT / MLX90640_LINE_NUM; 
+
+// ---- Fixed-point math definitions for interpolation ----
+constexpr int FIXED_POINT_SHIFT = 8; // Number of fractional bits
+constexpr int FIXED_POINT_SCALE = 1 << FIXED_POINT_SHIFT; // Scale factor (256)
+
+
+// ---- implementation ----
+
+// measure display frame rate with a timer interrupt
+static repeating_timer_t timer;
+static int frame_cnt = 0;
+static int fps = 0;
+
+bool timer_callback(repeating_timer_t *rt)
+{   
+    fps = frame_cnt;
+    frame_cnt = 0;
+    return true;
+}
+
+// a "heat" color map inspired by: http://www.andrewnoske.com/wiki/Code_-_heatmaps_and_color_gradients
+
+typedef struct {
+    uint8_t r, g, b;
+} RGBColor;
+
+#define RGB_BLACK {0, 0, 0} 
+#define RGB_RED {255, 38, 0} 
+#define RGB_YELLOW {255, 255, 0} 
+#define RGB_GREEN {0, 249, 0} 
+#define RGB_BLUE {4, 51, 255}
+#define RGB_ORANGE {255, 147, 0}
+#define RGB_CYAN {0, 253, 255}
+#define RGB_MAGENTA {255, 64, 255}
+#define RGB_PURPLE {148, 33, 146}
+#define RGB_WHITE {255, 255, 255} 
+
+// constexpr RGBColor colors[] = {RGB_BLACK, RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_YELLOW, RGB_RED, RGB_WHITE};
+constexpr RGBColor colors[] = {RGB_BLACK, RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_YELLOW, RGB_RED};
+
+static uint16_t palette[HEAT_MAP_SIZE];
+
+void heatmap_init() {
+    constexpr int numColors = sizeof(colors) / sizeof(RGBColor);
+    for (int c = 0; c < HEAT_MAP_SIZE; c++) {
+        float value = c * (numColors-1) / float(HEAT_MAP_SIZE-1);
+        int idx1 = int(value);
+        uint8_t red, green, blue;
+        if (idx1 == value) {
+            red = colors[idx1].r;
+            green = colors[idx1].g;
+            blue = colors[idx1].b;
+        } else {
+            int idx2 = idx1 + 1;
+            float fractBetween = value - idx1;
+            red = int(round((colors[idx2].r - colors[idx1].r) * fractBetween + colors[idx1].r));
+            green = int(round((colors[idx2].g - colors[idx1].g) * fractBetween + colors[idx1].g));
+            blue = int(round((colors[idx2].b - colors[idx1].b) * fractBetween + colors[idx1].b));
+        }
+        palette[c] = SSD1351_color(red, green, blue);
+    }
+}
+
+// These macros are still useful for horizontal/vertical flipping of the graph
+#if FLIP_GRAPH_HORIZONTAL
+#define TR_X(x) (GRAPH_WIDTH-1-(x))
+#else
+#define TR_X(x) (x)
+#endif
+#if FLIP_GRAPH_VERTICAL
+#define TR_Y(y) (GRAPH_HEIGHT-1-(y))
+#else
+#define TR_Y(y) (y)
+#endif
+
+typedef struct {
+    float min, max;                  // min and max temperature values
+    uint8_t values[MLX90640_PIXEL_NUM]; // temperature values from [min .. max] scaled to [0 .. HEAT_MAP_SIZE-1]
+
+    inline uint8_t value(int16_t x, int16_t y) {
+        return values[(y << 5) + x];
+    }
+} FrameDTO;
+
+// Helper to get smoothed value at a given sensor coordinate
+// Returns an integer palette index (0 to HEAT_MAP_SIZE-1)
+int get_smoothed_sensor_value(int sensor_x, int sensor_y) {
+    if (frame_count == 0) {
+        return 0; // No frames to average yet
+    }
+
+    int sum_values = 0;
+    for (int i = 0; i < frame_count; i++) {
+        // Clamp coordinates to prevent out-of-bounds access
+        int clamped_x = sensor_x;
+        if (clamped_x < 0) clamped_x = 0;
+        if (clamped_x >= MLX90640_COLUMN_NUM) clamped_x = MLX90640_COLUMN_NUM - 1;
+
+        int clamped_y = sensor_y;
+        if (clamped_y < 0) clamped_y = 0;
+        if (clamped_y >= MLX90640_LINE_NUM) clamped_y = MLX90640_LINE_NUM - 1;
+        
+        sum_values += frame_buffers[i][clamped_y][clamped_x];
+    }
+    // Return rounded average
+    return (sum_values + frame_count / 2) / frame_count;
+}
+
+void display_smoothed_frame(FrameDTO* dto) {
+    uint8_t current_frame[MLX90640_LINE_NUM][MLX90640_COLUMN_NUM];
+
+    // 1. Read the current frame data into a temporary buffer
+    for (int y = 0; y < MLX90640_LINE_NUM; y++) {
+        for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+            int index = y * MLX90640_COLUMN_NUM + x;
+            current_frame[y][x] = dto->values[index]; // Store as uint8_t
+        }
+    }
+
+    // 2. Update the frame buffers and shift previous frames
+    if (frame_count < NUM_FRAMES) {
+        frame_count++;
+    }
+
+    for (int i = NUM_FRAMES - 1; i > 0; i--) {
+        memcpy(frame_buffers[i], frame_buffers[i - 1], sizeof(frame_buffers[i]));
+    }
+    memcpy(frame_buffers[0], current_frame, sizeof(current_frame));
+
+    // Pre-calculate for scaling display coordinates to sensor coordinates with fixed point
+    // sensor_coord_fixed = (display_coord * SENSOR_DIM * FIXED_POINT_SCALE) / GRAPH_DIM
+    const long sensor_x_numerator = (long)MLX90640_COLUMN_NUM * FIXED_POINT_SCALE;
+    const long sensor_y_numerator = (long)MLX90640_LINE_NUM * FIXED_POINT_SCALE;
+
+    // 3. Process and draw each display pixel with integer bilinear interpolation
+    for (int display_y = 0; display_y < GRAPH_HEIGHT; display_y++) {
+        for (int display_x = 0; display_x < GRAPH_WIDTH; display_x++) {
+            // Convert display coordinates to fixed-point sensor coordinates
+            // Ensure intermediate multiplication does not overflow before division
+            int sensor_x_fixed = (int)(((long)display_x * sensor_x_numerator) / GRAPH_WIDTH);
+            int sensor_y_fixed = (int)(((long)display_y * sensor_y_numerator) / GRAPH_HEIGHT);
+
+            // Determine the four surrounding sensor pixel integer coordinates
+            int x1 = sensor_x_fixed / FIXED_POINT_SCALE;
+            int y1 = sensor_y_fixed / FIXED_POINT_SCALE;
+            int x2 = x1 + 1;
+            int y2 = y1 + 1;
+
+            // Calculate the fractional parts (already scaled by FIXED_POINT_SCALE)
+            int fx_fixed = sensor_x_fixed % FIXED_POINT_SCALE; // or sensor_x_fixed - (x1 * FIXED_POINT_SCALE)
+            int fy_fixed = sensor_y_fixed % FIXED_POINT_SCALE; // or sensor_y_fixed - (y1 * FIXED_POINT_SCALE)
+
+            // Get the smoothed integer values of the four corner sensor pixels
+            int q11 = get_smoothed_sensor_value(x1, y1);
+            int q12 = get_smoothed_sensor_value(x1, y2);
+            int q21 = get_smoothed_sensor_value(x2, y1);
+            int q22 = get_smoothed_sensor_value(x2, y2);
+            
+            // Perform bilinear interpolation using integer math
+            // Interpolate along x-axis for y1 and y2
+            // Result is q_val * (SCALE - f_scaled) + q_val * f_scaled. To get rounded result: (sum + SCALE/2) / SCALE
+            long interpolated_x1_val = (long)q11 * (FIXED_POINT_SCALE - fx_fixed) + (long)q21 * fx_fixed;
+            int ix1 = (interpolated_x1_val + (FIXED_POINT_SCALE / 2)) / FIXED_POINT_SCALE;
+
+            long interpolated_x2_val = (long)q12 * (FIXED_POINT_SCALE - fx_fixed) + (long)q22 * fx_fixed;
+            int ix2 = (interpolated_x2_val + (FIXED_POINT_SCALE / 2)) / FIXED_POINT_SCALE;
+
+            // Interpolate along y-axis using the results from x-axis interpolation
+            long final_interpolated_val_long = (long)ix1 * (FIXED_POINT_SCALE - fy_fixed) + (long)ix2 * fy_fixed;
+            int final_interpolated_value = (final_interpolated_val_long + (FIXED_POINT_SCALE / 2)) / FIXED_POINT_SCALE;
+
+            // final_interpolated_value is the palette index
+            int palette_index = final_interpolated_value;
+
+            // Clamp the index to ensure it's within the valid range of the palette
+            if (palette_index < 0) palette_index = 0;
+            if (palette_index >= HEAT_MAP_SIZE) palette_index = HEAT_MAP_SIZE - 1;
+
+            // Display the individual display pixel
+            SSD1351_pixel(TR_X(display_x), TR_Y(display_y), palette[palette_index]);
+        }
+    }
+}
+
+
+void renderer() {
+
+    SSD1351_SPIInit();
+
+    heatmap_init();
+    
+    add_repeating_timer_ms(1000, &timer_callback, NULL, &timer);
+
+    // create a single DTO for the communication between main thread (core0) and renderer thread (core1)
+    multicore_fifo_push_blocking((uint32_t)new FrameDTO());
+
+    // process DTOs received from core0
+    while (true) {
+
+        // wait for a frame DTO received from core0
+        FrameDTO *dto = (FrameDTO*) multicore_fifo_pop_blocking();
+        display_smoothed_frame(dto);
+
+        float min = dto->min;
+        float max = dto->max;
+
+        // send frame back to core0
+        multicore_fifo_push_blocking((uint32_t)dto);
+
+        // Clear the banner area before drawing new text
+        int banner_y_start = GRAPH_HEIGHT; 
+        SSD1351_fillrect(0, banner_y_start, DISPLAY_WIDTH, BANNER_HEIGHT, BLACK);
+
+        // Adjust text Y coordinates to be within the banner area
+        int text_y = banner_y_start + 4; // A small offset from the top of the banner
+
+        char buf[32];
+        sprintf(buf, "%.0f", min);
+        SSD1351_text(1, text_y, buf, WHITE);
+
+        sprintf(buf, "%d fps", fps);
+        int w = SSD1351_textwidth(buf);
+        SSD1351_text((DISPLAY_WIDTH-w) / 2, text_y, buf, WHITE);
+
+        sprintf(buf, "%.0f", max);
+        w = SSD1351_textwidth(buf);
+        SSD1351_text(DISPLAY_WIDTH-w-1, text_y, buf, WHITE);
+
+        SSD1351_update();
+
+        frame_cnt++;
+    }
+}
+
+int main() {
+
+    stdio_init_all();
+
+    multicore_launch_core1(renderer);
+
+    sleep_ms(40 + 500); // after Power-On wait a bit for the MLX90640 to initialize
+
+    MLX90640_I2CInit();
+    MLX90640_SetResolution(MLX_I2C_ADDR, 3);     // 0: 16 bit, 1: 17 bit, 2 = 18 bit, 3 = 19 bit
+    MLX90640_SetRefreshRate(MLX_I2C_ADDR, REFRESH_RATE);
+    MLX90640_SetChessMode(MLX_I2C_ADDR);
+
+    uint16_t *eeMLX90640 = new uint16_t[832];      // too large for allocating on stack 
+    MLX90640_DumpEE(MLX_I2C_ADDR, eeMLX90640);
+    paramsMLX90640 *params = new paramsMLX90640;   // too large for allocating on stack 
+    MLX90640_ExtractParameters(eeMLX90640, params);
+    delete[] eeMLX90640; // Use delete[] for arrays
+
+    uint16_t *captureFrame = new uint16_t[834];    // too large for allocating on stack 
+    float *values = new float[MLX90640_PIXEL_NUM]; // too large for allocating on stack 
+    int patternMode = MLX90640_GetCurMode(MLX_I2C_ADDR);
+
+    while (true) {
+
+        // read pages (half frames) from the MLX90640
+        int status = MLX90640_GetFrameData(MLX_I2C_ADDR, captureFrame);
+        if (status < 0) {
+            printf("Error: MLX90640_GetFrameData returned %d\n", status);
+            continue;   // skip this frame
+        }
+        float eTa = MLX90640_GetTa(captureFrame, params) + OPENAIR_TA_SHIFT;
+        MLX90640_CalculateTo(captureFrame, params, EMISSIVITY, eTa, values);
+        MLX90640_BadPixelsCorrection(params->brokenPixels, values, patternMode, params);
+        MLX90640_BadPixelsCorrection(params->outlierPixels, values, patternMode, params);
+
+        // find min and max temperature values of the frame
+        float min_temp, max_temp; // Renamed to avoid conflict with dto->min/max
+        min_temp = max_temp = values[0];
+        for (int i = 1; i < MLX90640_PIXEL_NUM; i++) {
+            float value = values[i];
+            if (value > max_temp)
+                max_temp = value;
+            if (value < min_temp)
+                min_temp = value;
+        }
+//        min_temp = min_temp+5; // Commented out for now
+        // create a DTO for the renderer
+        FrameDTO *dto = (FrameDTO*)multicore_fifo_pop_blocking(); // Wait for renderer to return previous DTO
+        dto->min = min_temp;
+        dto->max = max_temp;
+
+        // Scale float temperature values to uint8_t palette indices
+        // Ensure min_temp_eff is not >= max_temp_eff to prevent division by zero or negative step
+        float min_temp_eff = floor(min_temp + 5.0); //adjust display floor value
+        float max_temp_eff = ceil(max_temp -1.0); //adjust display top value
+        if (min_temp_eff >= max_temp_eff) { // Ensure max is always greater than min for scaling
+             max_temp_eff = min_temp_eff + 1.0f; // Arbitrary small range if temps are identical
+        }
+        
+        float step = (max_temp_eff - min_temp_eff) / float(HEAT_MAP_SIZE-1);
+        if (step <= 0) step = 0.001f; // Prevent division by zero or negative if something unexpected happens
+
+        for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+            // Apply the -5 offset for darkness after calculating the effective min for scaling
+            float scaled_value = (values[i] - (min_temp_eff + 0.0f)) / step; 
+            if (scaled_value < 0) scaled_value = 0;
+            if (scaled_value >= HEAT_MAP_SIZE) scaled_value = HEAT_MAP_SIZE - 1;
+            dto->values[i] = (uint8_t)round(scaled_value);
+        }
+        multicore_fifo_push_blocking((uint32_t)dto);
+    }
+
+    delete[] values; // Use delete[] for arrays
+    delete[] captureFrame; // Use delete[] for arrays
+    delete params; // This was allocated with 'new paramsMLX90640', so 'delete' is correct
+    return 0;
+}
