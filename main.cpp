@@ -73,7 +73,9 @@ constexpr uint8_t MLX_I2C_ADDR = 0x33;          // I2C address of the MLX90640
 constexpr uint16_t BANNER_HEIGHT = 16;                                  // bottom strip holding min / fps / max
 constexpr uint32_t BANNER_INTERVAL_US = 350000;                         // ~3 banner refreshes a second
 constexpr uint16_t GRAPH_WIDTH = DISPLAY_WIDTH;                         // width of the thermal camera graph on the OLED display
-constexpr uint16_t GRAPH_HEIGHT = DISPLAY_HEIGHT - BANNER_HEIGHT;       // height of the thermal camera graph on the OLED display
+// the largest true-aspect image a 128 wide area can hold: the sensor is 32x24,
+// so width is always the binding constraint and 96 is the tallest 4:3 fit
+constexpr uint16_t GRAPH_HEIGHT = (GRAPH_WIDTH * MLX90640_LINE_NUM) / MLX90640_COLUMN_NUM;
 
 // interpolation lookup tables, built once: source index and fractional weight
 // for every display column and row. Mapping the last display pixel exactly onto
@@ -208,6 +210,8 @@ void renderer() {
     heatmap_init();
     interp_tables_init();
 
+    SSD1351_update();   // clear the whole panel once; rows below the banner are never pushed again
+
     add_repeating_timer_ms(1000, &timer_callback, NULL, &timer);
 
     // Two frame buffers. Core0 fills one while core1 renders the other, and a
@@ -304,7 +308,7 @@ void renderer() {
         PROF_ACC(p_text, t_text);
 
         PROF_T(t_spi);
-        SSD1351_update_rows(0, banner_dirty ? DISPLAY_HEIGHT - 1 : GRAPH_HEIGHT - 1);
+        SSD1351_update_rows(0, banner_dirty ? GRAPH_HEIGHT + BANNER_HEIGHT - 1 : GRAPH_HEIGHT - 1);
         PROF_ACC(p_spi, t_spi);
 
         // the frame is on the display now, so this buffer can be refilled
