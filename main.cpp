@@ -14,12 +14,10 @@
  * limitations under the License.
  */
 #include <cstdio>
-#include <ctime>
 #include <math.h>
 #include <pico/stdlib.h>
 #include "pico/multicore.h"
 #include "hardware/i2c.h"
-#include "hardware/adc.h"
 
 extern "C"{
 #include <MLX90640_I2C_Driver.h>
@@ -53,13 +51,12 @@ constexpr bool BILINEAR_INTERPOLATION = true;   // if true use bilinear interpol
 // per-stage microsecond accumulators, summed over a 1 second window
 static volatile uint32_t p_wait, p_read, p_calc, p_scale, p_fifo0;  // core0 stages
 static volatile uint32_t p_render, p_text, p_spi, p_fifo1;          // core1 stages
-static volatile bool p_report = false;
 static uint32_t p_loops = 0;
 static uint32_t p_window_start = 0;
 static volatile uint32_t p_latency = 0;   // sensor-ready to pixels-on-screen
 static volatile uint32_t p_l1 = 0, p_l2 = 0, p_l3 = 0;  // core0 / queue / core1 shares
-static int p_trace = 3;     // trace the first few iterations stage by stage
-#define TRACE(msg) do { if (p_trace > 0) printf("  trace: " msg "\n"); } while (0)
+static char p_boot_line[192];
+static int p_boot_repeats = 3;
 #define PROF_T(v)        uint32_t v = time_us_32()
 #define PROF_ACC(acc, v) acc += time_us_32() - (v)
 #else
@@ -118,9 +115,6 @@ bool timer_callback(repeating_timer_t *rt)
 {   
     fps = frame_cnt;
     frame_cnt = 0;
-#if PROFILE
-    p_report = true;
-#endif
     return true;
 }
 
@@ -341,58 +335,52 @@ int main() {
 
     stdio_init_all();
 
-#if PROFILE
-    // give a host serial monitor time to attach before the boot markers go out
-    for (int i = 0; i < 8; i++) {
-        printf("boot: waiting for host %d\n", i);
-        sleep_ms(250);
-    }
-    printf("boot: stdio up\n");
-#endif
+    const uint32_t t_boot_stdio = time_us_32();
 
     multicore_launch_core1(renderer);
-    printf("boot: core1 launched\n");
-
-    sleep_ms(40 + 500); // after Power-On wait a bit for the MLX90640 to initialize
+    const uint32_t t_boot_core1 = time_us_32();
 
     MLX90640_I2CInit();
+
+    // Wait for the MLX90640 to answer rather than sleeping a fixed 540ms. On a
+    // warm reset the sensor is still powered and replies at once; on a cold start
+    // this waits exactly as long as it actually needs. The settle delay after the
+    // first ACK is margin for the sensor's own internal init.
+    uint32_t probe_us = time_us_32();
+    uint8_t probe;
+    while (i2c_read_blocking(i2c0, MLX_I2C_ADDR, &probe, 1, false) < 0) {
+        if (time_us_32() - probe_us > 1000000) {
+            break;      // give up waiting and let the driver report the failure
+        }
+        sleep_ms(2);
+    }
+    const uint32_t t_boot_ack = time_us_32();
+    sleep_ms(25);
     MLX90640_SetResolution(MLX_I2C_ADDR, 3);    // 0: 16 bit, 1: 17 bit, 2 = 18 bit, 3 = 19 bit
     MLX90640_SetRefreshRate(MLX_I2C_ADDR, REFRESH_RATE);
     MLX90640_SetChessMode(MLX_I2C_ADDR);
 
-    printf("boot: sensor configured\n");
+    const uint32_t t_boot_cfg = time_us_32();
 
     uint16_t *eeMLX90640 = new uint16_t[832];       // too large for allocating on stack
     int ee_err = MLX90640_DumpEE(MLX_I2C_ADDR, eeMLX90640);
-    printf("boot: DumpEE -> %d\n", ee_err);
+    const uint32_t t_boot_ee = time_us_32();
     paramsMLX90640 *params = new paramsMLX90640;    // too large for allocating on stack
     int pe_err = MLX90640_ExtractParameters(eeMLX90640, params);
-    printf("boot: ExtractParameters -> %d\n", pe_err);
+    const uint32_t t_boot_params = time_us_32();
     delete eeMLX90640;
 
     uint16_t *captureFrame = new uint16_t[834];     // too large for allocating on stack 
     float *values = new float[MLX90640_PIXEL_NUM];  // too large for allocating on stack 
     int patternMode = MLX90640_GetCurMode(MLX_I2C_ADDR);
     FrameDTO *dto = NULL;   // held across iterations so a skipped frame never loses it
-    {
-        adc_init();
-        printf("boot: ADC scan (3V3 ref, 12 bit)\n");
-        for (int ch = 0; ch < 4; ch++) {
-            adc_gpio_init(26 + ch);
-            adc_select_input(ch);
-            sleep_ms(2);
-            uint32_t acc = 0;
-            for (int i = 0; i < 64; i++) acc += adc_read();
-            float v = (acc / 64.0f) * 3.3f / 4096.0f;
-            printf("boot:   GP%d (ADC%d) raw=%4lu  %.3f V\n", 26 + ch, ch, acc / 64, (double)v);
-        }
-    }
-    printf("boot: patternMode=%d, entering main loop\n", patternMode);
-    {
-        extern volatile uint32_t g_spi_baud, g_clk_peri, g_dma_pushes, g_pio_pushes;
-        printf("boot: clk_peri=%lu Hz, spi baud=%lu Hz, dma_pushes=%lu blocking_pushes=%lu\n",
-               g_clk_peri, g_spi_baud, g_dma_pushes, g_pio_pushes);
-    }
+    snprintf(p_boot_line, sizeof(p_boot_line),
+             "boot (ms from power-on): stdio=%lu core1=%lu sensorcfg=%lu dumpEE=%lu"
+             " params=%lu loop=%lu  [sensorACK=%lu EE->%d params->%d mode=%d]",
+             t_boot_stdio/1000, t_boot_core1/1000, t_boot_cfg/1000,
+             t_boot_ee/1000, t_boot_params/1000, time_us_32()/1000,
+             (t_boot_ack - probe_us)/1000, ee_err, pe_err, patternMode);
+    printf("%s\n", p_boot_line);
 
 
     while (true) {
@@ -405,6 +393,7 @@ int main() {
             uint32_t elapsed = now - p_window_start;
             p_window_start = now;
             const uint32_t n = 32;
+            if (p_boot_repeats > 0) { p_boot_repeats--; printf("%s\n", p_boot_line); }
             printf("%2lu fps | core0 wait=%5lu read=%5lu calc=%5lu scale=%4lu fifo=%5lu"
                    " | core1 wait=%5lu render=%5lu spi=%5lu | lat=%6lu = %5lu + %5lu + %5lu\n",
                    (uint32_t)(32000000UL / (elapsed ? elapsed : 1)),
@@ -438,13 +427,11 @@ int main() {
         }
         PROF_ACC(p_wait, t_wait);
         const uint32_t t_ready = time_us_32();
-        TRACE("sensor data ready");
 
         // read pages (half frames) from the MLX90640
         PROF_T(t_read);
         int status = MLX90640_GetFrameData(MLX_I2C_ADDR, captureFrame);
         PROF_ACC(p_read, t_read);
-        TRACE("frame read");
         if (status < 0) {
             printf("Error: MLX90640_GetFrameData returned %d\n", status);
             continue;   // skip this frame
@@ -455,7 +442,6 @@ int main() {
         MLX90640_BadPixelsCorrection(params->brokenPixels, values, patternMode, params);
         MLX90640_BadPixelsCorrection(params->outlierPixels, values, patternMode, params);
         PROF_ACC(p_calc, t_calc);
-        TRACE("CalculateTo done");
 
         // find min and max temperature values of the frame
         PROF_T(t_scale);
@@ -484,8 +470,6 @@ int main() {
         dto->t_push = time_us_32();
         multicore_fifo_push_blocking((uint32_t)dto);
         dto = NULL;
-        TRACE("pushed DTO to core1");
-        if (p_trace > 0) p_trace--;
     }
 
     delete values;

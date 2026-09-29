@@ -28,7 +28,7 @@ target_link_libraries(thermocam
     hardware_i2c
     hardware_spi
     hardware_dma
-    hardware_adc
+
     hardware_gpio
     pico_multicore
 )

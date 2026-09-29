@@ -17,7 +17,6 @@
 #include "hardware/spi.h"
 #include "hardware/gpio.h"
 #include "hardware/dma.h"
-#include "hardware/clocks.h"
 #include "SSD1351_API.h"
 
 // configure the OLED SSD1351 on the SPI bus 1 (SCK: 10, MOSI: 11, DC: 9, CS: 13, RST: 15)
@@ -33,10 +32,6 @@
 #define SSD1351_SPI_BAUD (16 * 1000 * 1000)
 
 static int spi_dma_chan = -1;
-volatile uint32_t g_spi_baud = 0;
-volatile uint32_t g_clk_peri = 0;
-volatile uint32_t g_dma_pushes = 0;
-volatile uint32_t g_pio_pushes = 0;
 
 static void spi_dma_init(void) {
     spi_dma_chan = dma_claim_unused_channel(true);
@@ -50,8 +45,7 @@ static void spi_dma_init(void) {
 
 void SSD1351_SPIInit(void) {
 
-    g_spi_baud = spi_init(SPI_PORT, SSD1351_SPI_BAUD);
-    g_clk_peri = clock_get_hz(clk_peri);
+    spi_init(SPI_PORT, SSD1351_SPI_BAUD);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
 
@@ -95,7 +89,6 @@ void SSD1351_write_command(uint8_t cmd, const char* data, uint16_t len)
         if (len >= 64 && spi_dma_chan >= 0) {
             // the framebuffer push is large enough that the per-byte overhead of
             // spi_write_blocking costs more than the wire time saved by avoiding DMA setup
-            g_dma_pushes++;
             dma_channel_set_read_addr(spi_dma_chan, data, false);
             dma_channel_set_trans_count(spi_dma_chan, len, true);
             dma_channel_wait_for_finish_blocking(spi_dma_chan);
@@ -104,7 +97,6 @@ void SSD1351_write_command(uint8_t cmd, const char* data, uint16_t len)
                 tight_loop_contents();
             }
         } else {
-            g_pio_pushes++;
             spi_write_blocking(SPI_PORT, (const uint8_t*) data, len);
         }
         gpio_put(PIN_CS, 1);
