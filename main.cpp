@@ -68,9 +68,33 @@ static int p_trace = 3;     // trace the first few iterations stage by stage
 
 constexpr uint8_t MLX_I2C_ADDR = 0x33;          // I2C address of the MLX90640
 
-constexpr uint8_t PIXEL_SIZE = DISPLAY_WIDTH / MLX90640_COLUMN_NUM;     // width and height of a single thermal camera pixel on the OLED display
-constexpr uint16_t GRAPH_WIDTH = MLX90640_COLUMN_NUM * PIXEL_SIZE;      // width of the thermal camera graph on the OLED display
-constexpr uint16_t GRAPH_HEIGHT = MLX90640_LINE_NUM * PIXEL_SIZE;       // height of the thermal camera graph on the OLED display
+constexpr uint16_t BANNER_HEIGHT = 16;                                  // bottom strip holding min / fps / max
+constexpr uint16_t GRAPH_WIDTH = DISPLAY_WIDTH;                         // width of the thermal camera graph on the OLED display
+constexpr uint16_t GRAPH_HEIGHT = DISPLAY_HEIGHT - BANNER_HEIGHT;       // height of the thermal camera graph on the OLED display
+
+// interpolation lookup tables, built once: source index and fractional weight
+// for every display column and row. Mapping the last display pixel exactly onto
+// the last sensor pixel needs the (DST-1) denominator, so the outermost sensor
+// row and column reach full weight instead of being truncated away.
+static uint8_t  ipx0[GRAPH_WIDTH],  ipy0[GRAPH_HEIGHT];
+static uint16_t ipxf[GRAPH_WIDTH],  ipyf[GRAPH_HEIGHT];
+
+static void interp_tables_init() {
+    for (int x = 0; x < GRAPH_WIDTH; x++) {
+        int32_t pos = (x * ((MLX90640_COLUMN_NUM - 1) << 8)) / (GRAPH_WIDTH - 1);
+        int32_t i = pos >> 8, f = pos & 0xff;
+        if (i >= MLX90640_COLUMN_NUM - 1) { i = MLX90640_COLUMN_NUM - 2; f = 256; }
+        ipx0[x] = (uint8_t)i;
+        ipxf[x] = (uint16_t)f;
+    }
+    for (int y = 0; y < GRAPH_HEIGHT; y++) {
+        int32_t pos = (y * ((MLX90640_LINE_NUM - 1) << 8)) / (GRAPH_HEIGHT - 1);
+        int32_t i = pos >> 8, f = pos & 0xff;
+        if (i >= MLX90640_LINE_NUM - 1) { i = MLX90640_LINE_NUM - 2; f = 256; }
+        ipy0[y] = (uint8_t)i;
+        ipyf[y] = (uint16_t)f;
+    }
+}
 
 // ---- implementation ----
 
@@ -175,6 +199,19 @@ void heatmap_init() {
 #define TR_Y(y) (y)
 #endif
 
+// fill a rectangle in graph coordinates, applying the flips to the whole rect.
+// Passing a flipped origin straight to SSD1351_fillrect would shift the block by
+// its own width and run past the right edge of the framebuffer.
+static inline void graph_fillrect(int x, int y, int w, int h, uint16_t color) {
+#if FLIP_GRAPH_HORIZONTAL
+    x = GRAPH_WIDTH - x - w;
+#endif
+#if FLIP_GRAPH_VERTICAL
+    y = GRAPH_HEIGHT - y - h;
+#endif
+    SSD1351_fillrect(x, y, w, h, color);
+}
+
 typedef struct {
     float min, max;                     // min and max temperature values
     uint8_t values[MLX90640_PIXEL_NUM]; // temperature values from [min .. max] scaled to [0 .. HEAT_MAP_SIZE-1]
@@ -189,11 +226,7 @@ void renderer() {
     SSD1351_SPIInit();
 
     heatmap_init();
-
-    for (int x = 0; x < DISPLAY_WIDTH; x++) {
-        int l = (x * HEAT_MAP_SIZE) / DISPLAY_WIDTH;
-        SSD1351_fillrect(x, 112, 1, 16, palette[l]);
-    }
+    interp_tables_init();
 
     add_repeating_timer_ms(1000, &timer_callback, NULL, &timer);
 
@@ -222,37 +255,38 @@ void renderer() {
         }
 
         if (bilinear_interpolation) {
-            // integer bilinear interpolation
-            int32_t mx = ((MLX90640_COLUMN_NUM - 1) << 7) / GRAPH_WIDTH;
-            int32_t my = ((MLX90640_LINE_NUM - 1) << 7) / GRAPH_HEIGHT;
-
+            // integer bilinear interpolation off the precomputed tables
             for (int y = 0; y < GRAPH_HEIGHT; y++) {
-                
-                int32_t y0 = (y * my) >> 7;
-                int32_t ty = (y * my) & 0x7f;
- 
+
+                const int32_t y0 = ipy0[y];
+                const int32_t ty = ipyf[y];
+                const uint8_t *row0 = &dto->values[y0 << 5];
+                const uint8_t *row1 = row0 + MLX90640_COLUMN_NUM;
+
                 for (int x = 0; x < GRAPH_WIDTH; x++) {
 
-                    int32_t x0 = (x * mx) >> 7;
-                    int32_t tx = (x * mx) & 0x7f;
+                    const int32_t x0 = ipx0[x];
+                    const int32_t tx = ipxf[x];
 
-                    int16_t v00 = dto->value(x0,   y0);
-                    int16_t v10 = dto->value(x0+1, y0);
-                    int16_t v01 = dto->value(x0,   y0+1);
-                    int16_t v11 = dto->value(x0+1, y0+1);
+                    int32_t v00 = row0[x0], v10 = row0[x0+1];
+                    int32_t v01 = row1[x0], v11 = row1[x0+1];
 
-                    int32_t s = v00 + ((tx * (v10-v00)) >> 7);
-                    int32_t e = v01 + ((tx * (v11-v01)) >> 7);
-                    int32_t v = s + ((ty * (e-s)) >> 7);
-          
+                    int32_t s = v00 + ((tx * (v10-v00)) >> 8);
+                    int32_t e = v01 + ((tx * (v11-v01)) >> 8);
+                    int32_t v = s + ((ty * (e-s)) >> 8);
+
                     SSD1351_pixel(TR_X(x), TR_Y(y), palette[v]);
                 }
             }
         } else {
-            // nearest neighbor interpolation
+            // nearest neighbor: each sensor pixel fills its own block of the graph
             for (int y = 0; y < MLX90640_LINE_NUM; y++) {
+                int y_top = (y * GRAPH_HEIGHT) / MLX90640_LINE_NUM;
+                int h = ((y + 1) * GRAPH_HEIGHT) / MLX90640_LINE_NUM - y_top;
                 for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
-                    SSD1351_fillrect(TR_X(x*PIXEL_SIZE), TR_Y(y*PIXEL_SIZE), PIXEL_SIZE, PIXEL_SIZE, palette[dto->value(x, y)]);
+                    int x_lft = (x * GRAPH_WIDTH) / MLX90640_COLUMN_NUM;
+                    int w = ((x + 1) * GRAPH_WIDTH) / MLX90640_COLUMN_NUM - x_lft;
+                    graph_fillrect(x_lft, y_top, w, h, palette[dto->value(x, y)]);
                 }
             }
         }
