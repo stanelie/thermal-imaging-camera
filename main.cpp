@@ -19,6 +19,7 @@
 #include <pico/stdlib.h>
 #include "pico/multicore.h"
 #include "hardware/i2c.h"
+#include "hardware/adc.h"
 
 extern "C"{
 #include <MLX90640_I2C_Driver.h>
@@ -72,10 +73,15 @@ constexpr uint8_t MLX_I2C_ADDR = 0x33;          // I2C address of the MLX90640
 
 constexpr uint16_t BANNER_HEIGHT = 16;                                  // bottom strip holding min / fps / max
 constexpr uint32_t BANNER_INTERVAL_US = 350000;                         // ~3 banner refreshes a second
+constexpr uint16_t BANNER_TOP = DISPLAY_HEIGHT - BANNER_HEIGHT;         // info bar along the bottom edge
 constexpr uint16_t GRAPH_WIDTH = DISPLAY_WIDTH;                         // width of the thermal camera graph on the OLED display
 // the largest true-aspect image a 128 wide area can hold: the sensor is 32x24,
 // so width is always the binding constraint and 96 is the tallest 4:3 fit
 constexpr uint16_t GRAPH_HEIGHT = (GRAPH_WIDTH * MLX90640_LINE_NUM) / MLX90640_COLUMN_NUM;
+
+// centre the image on the panel: the strip left above it carries the status
+// icons, the strip below it is the info bar
+constexpr uint16_t IMAGE_TOP = (DISPLAY_HEIGHT - GRAPH_HEIGHT) / 2;
 
 // interpolation lookup tables, built once: source index and fractional weight
 // for every display column and row. Mapping the last display pixel exactly onto
@@ -189,7 +195,7 @@ static inline void graph_fillrect(int x, int y, int w, int h, uint16_t color) {
 #if FLIP_GRAPH_VERTICAL
     y = GRAPH_HEIGHT - y - h;
 #endif
-    SSD1351_fillrect(x, y, w, h, color);
+    SSD1351_fillrect(x, IMAGE_TOP + y, w, h, color);
 }
 
 typedef struct {
@@ -257,7 +263,7 @@ void renderer() {
                     int32_t e = v01 + ((tx * (v11-v01)) >> 8);
                     int32_t v = s + ((ty * (e-s)) >> 8);
 
-                    SSD1351_pixel(TR_X(x), TR_Y(y), palette[v]);
+                    SSD1351_pixel(TR_X(x), IMAGE_TOP + TR_Y(y), palette[v]);
                 }
             }
         } else {
@@ -288,7 +294,7 @@ void renderer() {
         if (banner_dirty) {
             banner_due = now_us + BANNER_INTERVAL_US;
 
-            int y = GRAPH_HEIGHT;
+            int y = BANNER_TOP;
             SSD1351_fillrect(0, y, DISPLAY_WIDTH, BANNER_HEIGHT, BLACK);
 
             y += 4;
@@ -308,7 +314,11 @@ void renderer() {
         PROF_ACC(p_text, t_text);
 
         PROF_T(t_spi);
-        SSD1351_update_rows(0, banner_dirty ? GRAPH_HEIGHT + BANNER_HEIGHT - 1 : GRAPH_HEIGHT - 1);
+        if (banner_dirty) {
+            SSD1351_update_rows(0, DISPLAY_HEIGHT - 1);
+        } else {
+            SSD1351_update_rows(IMAGE_TOP, IMAGE_TOP + GRAPH_HEIGHT - 1);
+        }
         PROF_ACC(p_spi, t_spi);
 
         // the frame is on the display now, so this buffer can be refilled
@@ -364,6 +374,19 @@ int main() {
     float *values = new float[MLX90640_PIXEL_NUM];  // too large for allocating on stack 
     int patternMode = MLX90640_GetCurMode(MLX_I2C_ADDR);
     FrameDTO *dto = NULL;   // held across iterations so a skipped frame never loses it
+    {
+        adc_init();
+        printf("boot: ADC scan (3V3 ref, 12 bit)\n");
+        for (int ch = 0; ch < 4; ch++) {
+            adc_gpio_init(26 + ch);
+            adc_select_input(ch);
+            sleep_ms(2);
+            uint32_t acc = 0;
+            for (int i = 0; i < 64; i++) acc += adc_read();
+            float v = (acc / 64.0f) * 3.3f / 4096.0f;
+            printf("boot:   GP%d (ADC%d) raw=%4lu  %.3f V\n", 26 + ch, ch, acc / 64, (double)v);
+        }
+    }
     printf("boot: patternMode=%d, entering main loop\n", patternMode);
     {
         extern volatile uint32_t g_spi_baud, g_clk_peri, g_dma_pushes, g_pio_pushes;
