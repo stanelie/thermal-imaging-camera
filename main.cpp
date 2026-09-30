@@ -159,10 +159,12 @@ typedef struct {
 #define RGB_PURPLE {148, 33, 146}
 #define RGB_WHITE {255, 255, 255} 
 
-// palette from "version stan bilinear smoothing", May 2025: the repeated black
-// entries hold the bottom third of the range at black, which keeps low-end
-// sensor noise from showing as colour
-constexpr RGBColor colors[] = {RGB_BLACK, RGB_BLACK,
+// Derived from the May 2025 "version stan" palette. The gradient spans
+// (stops - 1) segments and the leading blacks consume the first of them, so
+// three blacks out of nine stops hold the coldest quarter of the range at
+// black. Fewer blacks show more detail in cool parts of the scene; more hide
+// low-end noise.
+constexpr RGBColor colors[] = {RGB_BLACK, RGB_BLACK, RGB_BLACK,
                                RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_YELLOW, RGB_RED, RGB_WHITE};
 //constexpr RGBColor colors[] = {RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_YELLOW, RGB_RED};
 //constexpr RGBColor colors[] = {RGB_BLUE, RGB_RED};
