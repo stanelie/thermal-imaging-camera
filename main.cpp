@@ -135,6 +135,7 @@ static void interp_tables_init() {
 // measure display frame rate with a timer interrupt
 static repeating_timer_t timer;
 static int frame_cnt = 0;
+volatile uint32_t g_sensor_errors = 0;   // shown in the banner; no serial on battery
 static int fps = 0;
 
 bool timer_callback(repeating_timer_t *rt)
@@ -217,7 +218,7 @@ volatile uint8_t g_palette = 0;
 #define PERSIST_SLOTS   (FLASH_SECTOR_SIZE / FLASH_PAGE_SIZE)
 constexpr uint8_t  REC_ARMED   = 0xA5;
 constexpr uint8_t  REC_SETTLED = 0x5A;
-constexpr uint32_t SETTLE_US   = 2000000;   // splash time; a shorter run counts as a press
+constexpr uint32_t SETTLE_US   = 1000000;   // splash time; a shorter run counts as a press
 
 static int persist_slot = -1;   // page holding this run's armed record
 
@@ -426,7 +427,11 @@ void renderer() {
             sprintf(buf, "%.0f", min);
             SSD1351_text(1, y, buf, WHITE);
 
-            sprintf(buf, "%d fps", fps);
+            if (g_sensor_errors) {
+                sprintf(buf, "%d fps E%lu", fps, (unsigned long)g_sensor_errors);
+            } else {
+                sprintf(buf, "%d fps", fps);
+            }
             int w = SSD1351_textwidth(buf);
             SSD1351_text((DISPLAY_WIDTH-w) / 2, y, buf, WHITE);
 
@@ -509,6 +514,7 @@ int main() {
         sleep_ms(2);
     }
     const uint32_t t_boot_ack = time_us_32();
+    const bool sensor_ack = (time_us_32() - probe_us) <= 1000000;
     sleep_ms(25);
     MLX90640_SetResolution(MLX_I2C_ADDR, 3);    // 0: 16 bit, 1: 17 bit, 2 = 18 bit, 3 = 19 bit
     MLX90640_SetRefreshRate(MLX_I2C_ADDR, REFRESH_RATE);
@@ -529,6 +535,19 @@ int main() {
     // on the first frame the rest would otherwise be uninitialised heap
     float *values = new float[MLX90640_PIXEL_NUM]();
     int patternMode = MLX90640_GetCurMode(MLX_I2C_ADDR);
+    if (!sensor_ack || ee_err != 0 || pe_err != 0) {
+        // There is no serial on battery, so report a failed sensor bring-up on
+        // the panel. Core1 is launched but still idle, waiting for its first
+        // frame, so the display is ours to draw on.
+        char line[40];
+        SSD1351_clear();
+        SSD1351_text(2, 40, (char*)"sensor fault", WHITE);
+        snprintf(line, sizeof(line), "ack%d ee%d par%d", sensor_ack ? 1 : 0, ee_err, pe_err);
+        SSD1351_text(2, 56, line, WHITE);
+        SSD1351_update();
+        sleep_ms(4000);
+    }
+
     FrameDTO *dto = NULL;   // held across iterations so a skipped frame never loses it
     snprintf(p_boot_line, sizeof(p_boot_line),
              "boot (ms from power-on): stdio=%lu core1=%lu sensorcfg=%lu dumpEE=%lu"
@@ -589,6 +608,7 @@ int main() {
         int status = MLX90640_GetFrameData(MLX_I2C_ADDR, captureFrame);
         PROF_ACC(p_read, t_read);
         if (status < 0) {
+            g_sensor_errors++;
             printf("Error: MLX90640_GetFrameData returned %d\n", status);
             continue;   // skip this frame
         }
