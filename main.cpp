@@ -19,6 +19,8 @@
 #include <pico/stdlib.h>
 #include "pico/multicore.h"
 #include "hardware/i2c.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 
 extern "C"{
 #include <MLX90640_I2C_Driver.h>
@@ -159,22 +161,119 @@ typedef struct {
 #define RGB_PURPLE {148, 33, 146}
 #define RGB_WHITE {255, 255, 255} 
 
-// Derived from the May 2025 "version stan" palette. The gradient spans
-// (stops - 1) segments and the leading blacks consume the first of them, so
-// three blacks out of nine stops hold the coldest quarter of the range at
-// black. Fewer blacks show more detail in cool parts of the scene; more hide
-// low-end noise.
-constexpr RGBColor colors[] = {RGB_BLACK, RGB_BLACK, RGB_BLACK,
-                               RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_YELLOW, RGB_RED, RGB_WHITE};
-//constexpr RGBColor colors[] = {RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_YELLOW, RGB_RED};
-//constexpr RGBColor colors[] = {RGB_BLUE, RGB_RED};
-//constexpr RGBColor colors[] = {RGB_VIOLET, RGB_ORANGE};
-//constexpr RGBColor colors[] = {RGB_BLACK, RGB_WHITE};
+// ---- palettes ----
+//
+// Each palette is a list of stops that heatmap_init interpolates across the
+// 256 entries. The gradient spans (stops - 1) segments, so repeating a colour
+// at the start holds that fraction of the range: three blacks out of nine stops
+// keep the coldest quarter black.
+
+constexpr RGBColor PAL_RAINBOW[] = {RGB_BLACK, RGB_BLACK, RGB_BLACK,
+                                    RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_YELLOW, RGB_RED, RGB_WHITE};
+
+// the classic thermal "ironbow": black through purple and red into white
+constexpr RGBColor PAL_IRON[] = {
+    {0, 0, 0}, {25, 0, 60}, {70, 0, 110}, {130, 10, 110}, {190, 40, 70},
+    {230, 90, 20}, {250, 150, 0}, {255, 205, 50}, {255, 240, 150}, {255, 255, 255}
+};
+
+constexpr RGBColor PAL_WHITEHOT[] = {RGB_BLACK, RGB_WHITE};
+constexpr RGBColor PAL_BLACKHOT[] = {RGB_WHITE, RGB_BLACK};
+
+struct PaletteDef {
+    const RGBColor *stops;
+    uint8_t         count;
+    const char     *name;
+};
+
+constexpr PaletteDef PALETTES[] = {
+    { PAL_RAINBOW,  sizeof(PAL_RAINBOW)  / sizeof(RGBColor), "rainbow" },
+    { PAL_IRON,     sizeof(PAL_IRON)     / sizeof(RGBColor), "iron"    },
+    { PAL_WHITEHOT, sizeof(PAL_WHITEHOT) / sizeof(RGBColor), "white hot" },
+    { PAL_BLACKHOT, sizeof(PAL_BLACKHOT) / sizeof(RGBColor), "black hot" },
+};
+constexpr int PALETTE_COUNT = sizeof(PALETTES) / sizeof(PaletteDef);
+
+// set before core1 starts, from the value persisted in flash
+volatile uint8_t g_palette = 0;
+
+// ---- palette selection persisted across power cycles ----
+//
+// There is no button on this board, so a short power cycle is the control: if a
+// run does not last SETTLE_US it is taken as a press and the palette advances.
+//
+// A record is written at boot ("armed") and a second one once the run has
+// lasted long enough ("settled"). At the next boot, an armed record with no
+// settled record after it means the previous run was cut short. The selected
+// palette rides in the record, so it persists.
+//
+// Flash endurance is specified per sector ERASE; programming costs nothing.
+// One 256-byte page per record and 16 pages per sector means one erase per 8
+// boots, so the 100k cycle rating becomes ~800k power cycles. The erase itself
+// takes up to 400ms on this part, so it only ever happens at boot, before core1
+// starts rendering. See the notes in persist_begin().
+
+#define PERSIST_OFFSET  (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+#define PERSIST_SLOTS   (FLASH_SECTOR_SIZE / FLASH_PAGE_SIZE)
+constexpr uint8_t  REC_ARMED   = 0xA5;
+constexpr uint8_t  REC_SETTLED = 0x5A;
+constexpr uint32_t SETTLE_US   = 2000000;   // splash time; a shorter run counts as a press
+
+static int persist_slot = -1;   // page holding this run's armed record
+
+static const uint8_t *persist_page(int i) {
+    return (const uint8_t *)(XIP_BASE + PERSIST_OFFSET + i * FLASH_PAGE_SIZE);
+}
+
+// program one page; at boot core1 has not started yet.
+static void persist_write(int slot, uint8_t kind, uint8_t palette) {
+    uint8_t page[FLASH_PAGE_SIZE];
+    memset(page, 0xFF, sizeof(page));
+    page[0] = kind;
+    page[1] = palette;
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_program(PERSIST_OFFSET + slot * FLASH_PAGE_SIZE, page, FLASH_PAGE_SIZE);
+    restore_interrupts(ints);
+}
+
+// Returns the palette to use, advancing it if the last run was cut short.
+static uint8_t persist_begin() {
+    int used = 0;
+    while (used < PERSIST_SLOTS && persist_page(used)[0] != 0xFF) used++;
+
+    uint8_t palette = 0;
+    bool pressed = false;
+    if (used > 0) {
+        const uint8_t *last = persist_page(used - 1);
+        palette = last[1] < PALETTE_COUNT ? last[1] : 0;
+        pressed = (last[0] == REC_ARMED);   // never settled -> the run was cut short
+    }
+    if (pressed) palette = (uint8_t)((palette + 1) % PALETTE_COUNT);
+
+    if (used + 2 > PERSIST_SLOTS) {         // no room for this run's two records
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(PERSIST_OFFSET, FLASH_SECTOR_SIZE);
+        restore_interrupts(ints);
+        used = 0;
+    }
+    persist_slot = used;
+    persist_write(persist_slot, REC_ARMED, palette);
+    return palette;
+}
+
+// Called once the run has lasted long enough to count as deliberate. This runs
+// while core0 is still the only core, so no handshake is needed: writing flash
+// with core1 rendering out of XIP is what made earlier attempts hang.
+static void persist_settled() {
+    persist_write(persist_slot + 1, REC_SETTLED, (uint8_t)g_palette);
+}
+
 
 static uint16_t palette[HEAT_MAP_SIZE];
 
 void heatmap_init() {
-    constexpr int numColors = sizeof(colors) / sizeof(RGBColor);
+    const RGBColor *colors = PALETTES[g_palette].stops;
+    const int numColors = PALETTES[g_palette].count;
     for (int c = 0; c < HEAT_MAP_SIZE; c++) {
         float value = c * (numColors-1) / float(HEAT_MAP_SIZE-1);
         int idx1 = int(value);
@@ -218,8 +317,7 @@ typedef struct {
 
 void renderer() {
 
-    SSD1351_SPIInit();
-
+    SSD1351_clear();
     heatmap_init();
     interp_tables_init();
 
@@ -368,6 +466,30 @@ int main() {
     stdio_init_all();
 
     const uint32_t t_boot_stdio = time_us_32();
+
+    g_palette = persist_begin();
+    printf("palette: %s (%d of %d)\n", PALETTES[g_palette].name, g_palette + 1, PALETTE_COUNT);
+
+    // Core0 brings the display up and holds a splash naming the palette. Cutting
+    // power during the splash is the camera's only control: the settled record
+    // below is never written, so the next boot advances the palette.
+    SSD1351_SPIInit();
+    SSD1351_clear();
+    {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s", PALETTES[g_palette].name);
+        int w = SSD1351_textwidth(buf);
+        SSD1351_text((DISPLAY_WIDTH - w) / 2, DISPLAY_HEIGHT / 2 - 4, buf, WHITE);
+        const char *hint = "off/on to change";
+        w = SSD1351_textwidth((char*)hint);
+        SSD1351_text((DISPLAY_WIDTH - w) / 2, DISPLAY_HEIGHT / 2 + 10, (char*)hint, WHITE);
+        SSD1351_update();
+    }
+    while (time_us_32() < SETTLE_US) {
+        tight_loop_contents();
+    }
+    persist_settled();
+    persist_slot = -1;
 
     multicore_launch_core1(renderer);
     const uint32_t t_boot_core1 = time_us_32();
@@ -561,6 +683,7 @@ int main() {
         dto->t_push = time_us_32();
         multicore_fifo_push_blocking((uint32_t)dto);
         dto = NULL;
+
     }
 
     delete values;
