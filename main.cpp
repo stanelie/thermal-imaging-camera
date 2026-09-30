@@ -43,6 +43,16 @@ constexpr uint16_t HEAT_MAP_SIZE = 256;         // the number of colors in the h
 // temporal average over this many frames, to damp sensor noise. 1 disables it.
 constexpr int SMOOTH_FRAMES = 1;
 
+// The palette was rescaled to the scene every frame from the raw min and max,
+// the two most noise-sensitive statistics available. Measured unsmoothed, the
+// range was rebuilt ~20 times a second and the span wandered over 9..12C, which
+// rescales every pixel by up to 30% a frame and makes the image pulse.
+// The endpoints are smoothed, but only when they contract: anything new in the
+// scene widens the range immediately, so nothing is ever clipped and there is
+// no per-pixel clamp to pay for.
+constexpr float RANGE_SMOOTH = 0.25f;   // ~0.13s to settle back in at 31fps
+constexpr float RANGE_MARGIN = 1.0f;    // degrees of headroom each side
+
 #define FLIP_GRAPH_HORIZONTAL 0
 #define FLIP_GRAPH_VERTICAL 1
 
@@ -464,16 +474,27 @@ int main() {
                 min = value;
         }
 
+
+        static float smin = 0, smax = 0;
+        static bool range_init = false;
+        if (!range_init) { smin = min; smax = max; range_init = true; }
+        smin += (min - smin) * RANGE_SMOOTH;
+        smax += (max - smax) * RANGE_SMOOTH;
+        float lo = smin - RANGE_MARGIN;
+        float hi = smax + RANGE_MARGIN;
+        if (min < lo) lo = min;     // widen at once rather than clip the scene
+        if (max > hi) hi = max;
+
         PROF_ACC(p_scale, t_scale);
 
         dto->t_ready = t_ready;
-        dto->min = min;
-        dto->max = max;
+        dto->min = lo;
+        dto->max = hi;
 
         PROF_T(t_scale2);
-        float step = (ceil(max + 1.0) - floor(min - 1.0)) / float(HEAT_MAP_SIZE-1);
+        float step = (hi - lo) / float(HEAT_MAP_SIZE-1);
         for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
-            dto->values[i] = uint8_t((values[i] - min) / step);
+            dto->values[i] = uint8_t((values[i] - lo) / step);
         }
         PROF_ACC(p_scale, t_scale2);
         dto->t_push = time_us_32();
