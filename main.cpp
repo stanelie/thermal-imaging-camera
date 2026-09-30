@@ -141,7 +141,7 @@ typedef struct {
 // palette from "version stan bilinear smoothing", May 2025: the repeated black
 // entries hold the bottom third of the range at black, which keeps low-end
 // sensor noise from showing as colour
-constexpr RGBColor colors[] = {RGB_BLACK, RGB_BLACK, RGB_BLACK, RGB_BLACK,
+constexpr RGBColor colors[] = {RGB_BLACK, RGB_BLACK,
                                RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_YELLOW, RGB_RED, RGB_WHITE};
 //constexpr RGBColor colors[] = {RGB_BLUE, RGB_CYAN, RGB_GREEN, RGB_YELLOW, RGB_RED};
 //constexpr RGBColor colors[] = {RGB_BLUE, RGB_RED};
