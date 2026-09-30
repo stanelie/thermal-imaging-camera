@@ -53,6 +53,17 @@ constexpr int SMOOTH_FRAMES = 1;
 constexpr float RANGE_SMOOTH = 0.25f;   // ~0.13s to settle back in at 31fps
 constexpr float RANGE_MARGIN = 1.0f;    // degrees of headroom each side
 
+// The sensor carries a column pattern of period 4 -- every 4th column shares an
+// ADC channel -- whose amplitude and phase wander at a few Hz. Measured live it
+// averages 1179mK and peaks at 5383mK, while its multi-frame average is only
+// 367mK, so a static correction cancels itself out and does nothing. It is only
+// two numbers per frame though (the cosine and sine amplitude at period 4), so
+// it can be measured and notched out frame by frame. Two degrees of freedom at
+// exactly 4-column period, which real scenes essentially never contain.
+#define NOTCH4 1
+static float notch4[4] = {0, 0, 0, 0};
+#define NOTCH(i) (notch4[(i) & 3])
+
 #define FLIP_GRAPH_HORIZONTAL 0
 #define FLIP_GRAPH_VERTICAL 1
 
@@ -390,7 +401,9 @@ int main() {
     delete eeMLX90640;
 
     uint16_t *captureFrame = new uint16_t[834];     // too large for allocating on stack 
-    float *values = new float[MLX90640_PIXEL_NUM];  // too large for allocating on stack 
+    // value-initialised: in chess mode CalculateTo only writes half the pixels, so
+    // on the first frame the rest would otherwise be uninitialised heap
+    float *values = new float[MLX90640_PIXEL_NUM]();
     int patternMode = MLX90640_GetCurMode(MLX_I2C_ADDR);
     FrameDTO *dto = NULL;   // held across iterations so a skipped frame never loses it
     snprintf(p_boot_line, sizeof(p_boot_line),
@@ -462,6 +475,41 @@ int main() {
         MLX90640_BadPixelsCorrection(params->outlierPixels, values, patternMode, params);
         PROF_ACC(p_calc, t_calc);
 
+#if NOTCH4
+        // Measure the period-4 column component of this frame. At period 4 the
+        // basis is cos = 1,0,-1,0 and sin = 0,1,0,-1, so the projection is just
+        // four running sums. The column means are high-passed first so that real
+        // scene gradient does not leak into the estimate.
+        {
+            float cm[MLX90640_COLUMN_NUM];
+            for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+                float acc = 0;
+                for (int y = 0; y < MLX90640_LINE_NUM; y++) acc += values[y * MLX90640_COLUMN_NUM + x];
+                cm[x] = acc * (1.0f / MLX90640_LINE_NUM);
+            }
+            float c = 0, sn = 0;
+            for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+                int lo = x - 3, hi = x + 3;
+                if (lo < 0) lo = 0;
+                if (hi > MLX90640_COLUMN_NUM - 1) hi = MLX90640_COLUMN_NUM - 1;
+                float a = 0;
+                for (int i = lo; i <= hi; i++) a += cm[i];
+                const float hp = cm[x] - a / (hi - lo + 1);
+                switch (x & 3) {
+                    case 0: c  += hp; break;
+                    case 1: sn += hp; break;
+                    case 2: c  -= hp; break;
+                    default: sn -= hp; break;
+                }
+            }
+            c *= 0.125f; sn *= 0.125f;      // -> 2x the cosine/sine amplitude
+            notch4[0] =  c * 0.5f;
+            notch4[1] =  sn * 0.5f;
+            notch4[2] = -c * 0.5f;
+            notch4[3] = -sn * 0.5f;
+        }
+#endif
+
         // find min and max temperature values of the frame
         PROF_T(t_scale);
         float min, max;
@@ -477,13 +525,19 @@ int main() {
 
         static float smin = 0, smax = 0;
         static bool range_init = false;
-        if (!range_init) { smin = min; smax = max; range_init = true; }
+        // only seed from a sane frame: seeding from a NaN would poison the
+        // smoothed range permanently
+        if (!range_init && min <= max && min > -200.0f && max < 1000.0f) {
+            smin = min; smax = max; range_init = true;
+        }
         smin += (min - smin) * RANGE_SMOOTH;
         smax += (max - smax) * RANGE_SMOOTH;
-        float lo = smin - RANGE_MARGIN;
-        float hi = smax + RANGE_MARGIN;
-        if (min < lo) lo = min;     // widen at once rather than clip the scene
-        if (max > hi) hi = max;
+        // Deliberately NOT widened to the raw min/max: a single outlier pixel
+        // would then stretch the range for that frame and compress the whole
+        // scene into the dark end of the palette, which shows as a black frame.
+        // Out-of-range pixels are clamped to the end colours instead.
+        const float lo = smin - RANGE_MARGIN;
+        const float hi = smax + RANGE_MARGIN;
 
         PROF_ACC(p_scale, t_scale);
 
@@ -492,9 +546,14 @@ int main() {
         dto->max = hi;
 
         PROF_T(t_scale2);
-        float step = (hi - lo) / float(HEAT_MAP_SIZE-1);
+        const float step = (hi - lo) / float(HEAT_MAP_SIZE-1);
+        const float inv_step = 1.0f / step;
+        const float off[4] = { lo + notch4[0], lo + notch4[1],
+                               lo + notch4[2], lo + notch4[3] };
         for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
-            dto->values[i] = uint8_t((values[i] - lo) / step);
+            int idx = (int)((values[i] - off[i & 3]) * inv_step);
+            if (idx < 0) idx = 0; else if (idx > HEAT_MAP_SIZE-1) idx = HEAT_MAP_SIZE-1;
+            dto->values[i] = (uint8_t)idx;
         }
         PROF_ACC(p_scale, t_scale2);
         dto->t_push = time_us_32();
