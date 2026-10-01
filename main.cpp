@@ -144,7 +144,6 @@ static void interp_tables_init() {
 // measure display frame rate with a timer interrupt
 static repeating_timer_t timer;
 static int frame_cnt = 0;
-volatile uint32_t g_sensor_errors = 0;   // shown in the banner; no serial on battery
 volatile uint32_t g_bad_pixels = 0;      // non-finite values seen in the last frame
 volatile int      g_ee_tries   = 1;      // EEPROM reads needed before parameters extracted
 volatile uint32_t g_range_spikes = 0;    // frames whose min/max jumped implausibly
@@ -440,11 +439,10 @@ void renderer() {
             SSD1351_text(1, y, buf, WHITE);
 
             int n = sprintf(buf, "%d", fps);
-            if (g_sensor_errors) n += sprintf(buf + n, " E%lu", (unsigned long)g_sensor_errors);
             if (g_bad_pixels)    n += sprintf(buf + n, " B%lu", (unsigned long)g_bad_pixels);
             if (g_range_spikes)  n += sprintf(buf + n, " S%lu", (unsigned long)g_range_spikes);
             if (g_ee_tries > 1)  n += sprintf(buf + n, " T%d", g_ee_tries);
-            if (!g_sensor_errors && !g_bad_pixels && !g_range_spikes && g_ee_tries <= 1) {
+            if (!g_bad_pixels && !g_range_spikes && g_ee_tries <= 1) {
                 sprintf(buf, "%d fps", fps);
             }
             int w = SSD1351_textwidth(buf);
@@ -540,9 +538,11 @@ int main() {
     uint16_t *eeMLX90640 = new uint16_t[832];       // too large for allocating on stack
     paramsMLX90640 *params = new paramsMLX90640;    // too large for allocating on stack
 
-    // An I2C ack only proves the sensor's interface is alive, not that its
-    // EEPROM is readable yet. Rather than guess at a settling delay, read it and
-    // check that the parameters extract cleanly; retry if they do not.
+    // Read the EEPROM and check the parameters extract cleanly, retrying if not.
+    // Kept as insurance, but note it has never fired on this hardware: the banner
+    // reports the attempt count as T and it has always read 1, on USB and on
+    // battery alike. So this is NOT what fixed the battery startup failure --
+    // that was excluding non-finite pixels from the range below.
     int ee_err = 0, pe_err = 0, ee_tries = 0;
     for (ee_tries = 1; ee_tries <= 8; ee_tries++) {
         ee_err = MLX90640_DumpEE(MLX_I2C_ADDR, eeMLX90640);
@@ -633,7 +633,6 @@ int main() {
         int status = MLX90640_GetFrameData(MLX_I2C_ADDR, captureFrame);
         PROF_ACC(p_read, t_read);
         if (status < 0) {
-            g_sensor_errors++;
             printf("Error: MLX90640_GetFrameData returned %d\n", status);
             continue;   // skip this frame
         }
