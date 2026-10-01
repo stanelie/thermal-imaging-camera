@@ -54,6 +54,15 @@ constexpr int SMOOTH_FRAMES = 1;
 // no per-pixel clamp to pay for.
 constexpr float RANGE_SMOOTH = 0.25f;   // ~0.13s to settle back in at 31fps
 constexpr float RANGE_MARGIN = 1.0f;    // degrees of headroom each side
+// Most the range may move in one frame. A corrupt pixel that still passes the
+// sensor's frame validation can read a few hundred degrees; without this it
+// drags the smoothed endpoint with it, the scene compresses into one end of the
+// palette, and the display goes dark for a few hundred ms until it decays back.
+constexpr float RANGE_MAX_JUMP = 12.0f;
+// A corrupt pixel is a lone spike; anything real in the scene covers several
+// pixels. So if the extreme value stands this far clear of the runner-up, it is
+// not believed and the runner-up is used instead.
+constexpr float RANGE_OUTLIER_GAP = 6.0f;
 
 // The sensor carries a column pattern of period 4 -- every 4th column shares an
 // ADC channel -- whose amplitude and phase wander at a few Hz. Measured live it
@@ -138,6 +147,7 @@ static int frame_cnt = 0;
 volatile uint32_t g_sensor_errors = 0;   // shown in the banner; no serial on battery
 volatile uint32_t g_bad_pixels = 0;      // non-finite values seen in the last frame
 volatile int      g_ee_tries   = 1;      // EEPROM reads needed before parameters extracted
+volatile uint32_t g_range_spikes = 0;    // frames whose min/max jumped implausibly
 static int fps = 0;
 
 bool timer_callback(repeating_timer_t *rt)
@@ -432,8 +442,9 @@ void renderer() {
             int n = sprintf(buf, "%d", fps);
             if (g_sensor_errors) n += sprintf(buf + n, " E%lu", (unsigned long)g_sensor_errors);
             if (g_bad_pixels)    n += sprintf(buf + n, " B%lu", (unsigned long)g_bad_pixels);
+            if (g_range_spikes)  n += sprintf(buf + n, " S%lu", (unsigned long)g_range_spikes);
             if (g_ee_tries > 1)  n += sprintf(buf + n, " T%d", g_ee_tries);
-            if (n == (int)strlen(buf) && !g_sensor_errors && !g_bad_pixels && g_ee_tries <= 1) {
+            if (!g_sensor_errors && !g_bad_pixels && !g_range_spikes && g_ee_tries <= 1) {
                 sprintf(buf, "%d fps", fps);
             }
             int w = SSD1351_textwidth(buf);
@@ -676,17 +687,34 @@ int main() {
         // infinite and every index NaN -- a permanently black image while the
         // max readout still tracks the scene. Range-check rather than isfinite:
         // NaN fails both comparisons, so it is skipped too.
-        min = 1e30f; max = -1e30f;
+        // The range is a smoothed display heuristic, so it does not need every
+        // pixel every frame. Alternating halves covers the image over two frames
+        // and halves the soft-float comparisons here, which were the single
+        // dearest thing in this loop.
+        static int range_phase = 0;
+        range_phase ^= 1;
+        float max1 = -1e30f, max2 = -1e30f, min1 = 1e30f, min2 = 1e30f;
         uint32_t bad = 0;
-        for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+        for (int i = range_phase; i < MLX90640_PIXEL_NUM; i += 2) {
             const float value = values[i];
-            if (!(value > -1000.0f && value < 5000.0f)) { bad++; continue; }
-            if (value > max) max = value;
-            if (value < min) min = value;
+            // Reject inf/NaN by testing the exponent field directly: a float
+            // compare is a soft-float call on this core, and two of them per
+            // pixel across 768 pixels is dearer than the rest of the loop.
+            uint32_t bits;
+            memcpy(&bits, &value, sizeof(bits));
+            if ((bits & 0x7F800000u) == 0x7F800000u) { bad++; continue; }
+            if (value > max1)      { max2 = max1; max1 = value; }
+            else if (value > max2) { max2 = value; }
+            if (value < min1)      { min2 = min1; min1 = value; }
+            else if (value < min2) { min2 = value; }
         }
         g_bad_pixels = bad;
-        if (bad == MLX90640_PIXEL_NUM) {   // nothing usable this frame
+        if (bad >= MLX90640_PIXEL_NUM / 2 - 1) {   // nothing usable this frame
             min = 0.0f; max = 1.0f;
+        } else {
+            // discount an extreme that no other pixel supports
+            max = (max1 - max2 > RANGE_OUTLIER_GAP) ? max2 : max1;
+            min = (min2 - min1 > RANGE_OUTLIER_GAP) ? min2 : min1;
         }
 
 
@@ -697,8 +725,12 @@ int main() {
         if (!range_init && min <= max && min > -200.0f && max < 1000.0f) {
             smin = min; smax = max; range_init = true;
         }
-        smin += (min - smin) * RANGE_SMOOTH;
-        smax += (max - smax) * RANGE_SMOOTH;
+        // feed the smoothing a rate-limited view of this frame's endpoints
+        float mn = min, mx = max;
+        if (mx > smax + RANGE_MAX_JUMP) { mx = smax + RANGE_MAX_JUMP; g_range_spikes++; }
+        if (mn < smin - RANGE_MAX_JUMP) { mn = smin - RANGE_MAX_JUMP; g_range_spikes++; }
+        smin += (mn - smin) * RANGE_SMOOTH;
+        smax += (mx - smax) * RANGE_SMOOTH;
         // Deliberately NOT widened to the raw min/max: a single outlier pixel
         // would then stretch the range for that frame and compress the whole
         // scene into the dark end of the palette, which shows as a black frame.
