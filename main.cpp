@@ -76,6 +76,12 @@ constexpr float RANGE_OUTLIER_GAP = 6.0f;
 static float notch4[4] = {0, 0, 0, 0};
 #define NOTCH(i) (notch4[(i) & 3])
 
+// Per-column flat field, in degrees, zero-sum so it does not shift absolute
+// temperature. Captured against a uniform target and kept in flash; see
+// flatfield_load(). The sensor shows a fixed left-to-right gradient of a few
+// kelvin that is not thermal self-heating and does not move with the scene.
+static float flatfield[MLX90640_COLUMN_NUM] = {0};
+
 #define FLIP_GRAPH_HORIZONTAL 0
 #define FLIP_GRAPH_VERTICAL 1
 
@@ -212,6 +218,7 @@ constexpr PaletteDef PALETTES[] = {
     { PAL_BLACKHOT, sizeof(PAL_BLACKHOT) / sizeof(RGBColor), "black hot", 1.8f },
 };
 constexpr int PALETTE_COUNT = sizeof(PALETTES) / sizeof(PaletteDef);
+constexpr int MODE_COUNT    = PALETTE_COUNT + 1;   // last position captures a flat field
 
 // set before core1 starts, from the value persisted in flash
 volatile uint8_t g_palette = 0;
@@ -233,6 +240,8 @@ volatile uint8_t g_palette = 0;
 // starts rendering. See the notes in persist_begin().
 
 #define PERSIST_OFFSET  (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+#define FLATFIELD_OFFSET (PICO_FLASH_SIZE_BYTES - 2 * FLASH_SECTOR_SIZE)
+constexpr uint32_t FF_MAGIC = 0x31304646;   // "FF01"
 #define PERSIST_SLOTS   (FLASH_SECTOR_SIZE / FLASH_PAGE_SIZE)
 constexpr uint8_t  REC_ARMED   = 0xA5;
 constexpr uint8_t  REC_SETTLED = 0x5A;
@@ -264,10 +273,10 @@ static uint8_t persist_begin() {
     bool pressed = false;
     if (used > 0) {
         const uint8_t *last = persist_page(used - 1);
-        palette = last[1] < PALETTE_COUNT ? last[1] : 0;
+        palette = last[1] < MODE_COUNT ? last[1] : 0;
         pressed = (last[0] == REC_ARMED);   // never settled -> the run was cut short
     }
-    if (pressed) palette = (uint8_t)((palette + 1) % PALETTE_COUNT);
+    if (pressed) palette = (uint8_t)((palette + 1) % MODE_COUNT);
 
     if (used + 2 > PERSIST_SLOTS) {         // no room for this run's two records
         uint32_t ints = save_and_disable_interrupts();
@@ -286,6 +295,36 @@ static uint8_t persist_begin() {
 static void persist_settled() {
     persist_write(persist_slot + 1, REC_SETTLED, (uint8_t)g_palette);
 }
+
+static void flatfield_load() {
+    const uint8_t *p = (const uint8_t *)(XIP_BASE + FLATFIELD_OFFSET);
+    uint32_t magic;
+    memcpy(&magic, p, sizeof(magic));
+    if (magic != FF_MAGIC) {
+        return;                      // none stored yet
+    }
+    for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+        int16_t mk;
+        memcpy(&mk, p + 4 + 2 * x, sizeof(mk));
+        flatfield[x] = mk * 0.001f;
+    }
+}
+
+static void flatfield_store(const float *field) {
+    static uint8_t page[FLASH_PAGE_SIZE];
+    memset(page, 0xFF, sizeof(page));
+    const uint32_t magic = FF_MAGIC;
+    memcpy(page, &magic, sizeof(magic));
+    for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+        const int16_t mk = (int16_t)(field[x] * 1000.0f);
+        memcpy(page + 4 + 2 * x, &mk, sizeof(mk));
+    }
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(FLATFIELD_OFFSET, FLASH_SECTOR_SIZE);
+    flash_range_program(FLATFIELD_OFFSET, page, FLASH_PAGE_SIZE);
+    restore_interrupts(ints);
+}
+
 
 
 static uint16_t palette[HEAT_MAP_SIZE];
@@ -495,8 +534,13 @@ int main() {
 
     const uint32_t t_boot_stdio = time_us_32();
 
-    g_palette = persist_begin();
-    printf("palette: %s (%d of %d)\n", PALETTES[g_palette].name, g_palette + 1, PALETTE_COUNT);
+    const uint8_t mode = persist_begin();
+    const bool do_calibrate = (mode >= PALETTE_COUNT);
+    // the settled record must not store the calibrate position, or the next
+    // boot would run it again
+    g_palette = do_calibrate ? 0 : mode;
+    const char *mode_name = do_calibrate ? "flat field" : PALETTES[g_palette].name;
+    printf("mode: %s (%d of %d)\n", mode_name, mode + 1, MODE_COUNT);
 
     // Core0 brings the display up and holds a splash naming the palette. Cutting
     // power during the splash is the camera's only control: the settled record
@@ -505,7 +549,7 @@ int main() {
     SSD1351_clear();
     {
         char buf[32];
-        snprintf(buf, sizeof(buf), "%s", PALETTES[g_palette].name);
+        snprintf(buf, sizeof(buf), "%s", mode_name);
         int w = SSD1351_textwidth(buf);
         SSD1351_text((DISPLAY_WIDTH - w) / 2, DISPLAY_HEIGHT / 2 - 4, buf, WHITE);
         const char *hint = "off/on to change";
@@ -519,7 +563,6 @@ int main() {
     persist_settled();
     persist_slot = -1;
 
-    multicore_launch_core1(renderer);
     const uint32_t t_boot_core1 = time_us_32();
 
     MLX90640_I2CInit();
@@ -582,6 +625,57 @@ int main() {
         SSD1351_update();
         sleep_ms(4000);
     }
+
+    if (do_calibrate) {
+        // Average the per-column profile against whatever uniform target is in
+        // front of the lens, store it zero-sum so absolute temperature is not
+        // shifted. Runs here, before core1 exists, because writing flash while
+        // the renderer executes from XIP is what hung earlier attempts.
+        SSD1351_clear();
+        SSD1351_text(2, 44, (char*)"flat field", WHITE);
+        SSD1351_text(2, 60, (char*)"fill view, hold", WHITE);
+        SSD1351_update();
+        sleep_ms(2500);
+
+        float acc[MLX90640_COLUMN_NUM] = {0};
+        int frames = 0;
+        for (int n = 0; n < 128; n++) {
+            uint16_t sr = 0;
+            while (!MLX90640_GET_DATA_READY(sr)) {
+                if (MLX90640_I2CRead(MLX_I2C_ADDR, MLX90640_STATUS_REG, 1, &sr) != 0) break;
+            }
+            if (MLX90640_GetFrameData(MLX_I2C_ADDR, captureFrame) < 0) continue;
+            const float eTa = MLX90640_GetTa(captureFrame, params) + OPENAIR_TA_SHIFT;
+            MLX90640_CalculateTo_fast(captureFrame, params, EMISSIVITY, eTa, values);
+            for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+                float col = 0;
+                for (int y = 0; y < MLX90640_LINE_NUM; y++) {
+                    col += values[y * MLX90640_COLUMN_NUM + x];
+                }
+                acc[x] += col * (1.0f / MLX90640_LINE_NUM);
+            }
+            frames++;
+        }
+
+        char msg[32];
+        if (frames > 16) {
+            float mean = 0;
+            for (int x = 0; x < MLX90640_COLUMN_NUM; x++) { acc[x] /= frames; mean += acc[x]; }
+            mean /= MLX90640_COLUMN_NUM;
+            for (int x = 0; x < MLX90640_COLUMN_NUM; x++) acc[x] -= mean;
+            flatfield_store(acc);
+            snprintf(msg, sizeof(msg), "saved %d frames", frames);
+        } else {
+            snprintf(msg, sizeof(msg), "failed, %d frames", frames);
+        }
+        SSD1351_clear();
+        SSD1351_text(2, 52, msg, WHITE);
+        SSD1351_update();
+        sleep_ms(2500);
+    }
+
+    flatfield_load();
+    multicore_launch_core1(renderer);
 
     FrameDTO *dto = NULL;   // held across iterations so a skipped frame never loses it
     snprintf(p_boot_line, sizeof(p_boot_line),
@@ -756,12 +850,17 @@ int main() {
         PROF_T(t_scale2);
         const float step = (hi - lo) / float(HEAT_MAP_SIZE-1);
         const float inv_step = 1.0f / step;
-        const float off[4] = { lo + notch4[0], lo + notch4[1],
-                               lo + notch4[2], lo + notch4[3] };
+        // One offset per sensor column, folding together the palette origin, the
+        // period-4 notch and the stored flat field. 32 entries instead of 4 costs
+        // nothing in the pixel loop: it is the same single indexed load.
+        float off[MLX90640_COLUMN_NUM];
+        for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+            off[x] = lo + notch4[x & 3] + flatfield[x];
+        }
         for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
             // clamp in float: casting a non-finite value to int is undefined,
             // and NaN fails both comparisons so it lands on 0
-            const float f = (values[i] - off[i & 3]) * inv_step;
+            const float f = (values[i] - off[i & (MLX90640_COLUMN_NUM - 1)]) * inv_step;
             const int idx = (f > 0.0f) ? (f < (float)(HEAT_MAP_SIZE-1) ? (int)f : HEAT_MAP_SIZE-1) : 0;
             dto->values[i] = (uint8_t)idx;
         }
