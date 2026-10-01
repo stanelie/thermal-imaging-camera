@@ -52,9 +52,21 @@ constexpr int SMOOTH_FRAMES = 1;
 // of a small difference truncates to zero and the pixel stops tracking
 // altogether -- it goes stale rather than clean, which looks far worse than the
 // noise it was meant to remove.
+// The threshold is in millikelvin, not palette steps. A step is not a fixed
+// temperature: the palette rescales to the scene, so on a wide-range view a step
+// is ~39mK and the sensor's ~1K noise is 25 steps, while on a uniform wall the
+// range collapses to its floor, a step becomes ~8mK, and the same noise is 125
+// steps -- above any fixed step threshold, so every pixel reads as motion and
+// the filter switches itself off exactly where it is needed most.
 #define MOTION_GATE 1
-constexpr int MOTION_THRESH = 70;   // ~3 sigma of the measured 17-step noise
-constexpr int MOTION_SHIFT  = 3;    // below it, move 1/(2^n) of the way
+constexpr int MOTION_THRESH_MK = 2700;  // follow instantly above this change
+constexpr int MOTION_SHIFT     = 4;     // below it, move 1/(2^n) of the way
+
+// Gentle 1-2-1 spatial blur on the 32x24 sensor data, applied after the temporal
+// gate. Independent pixel noise drops by about 2.7x. The cost in detail is small
+// here because the image is already upscaled 4x to the panel with bilinear
+// interpolation, which blurs it anyway. 0 disables.
+#define SPATIAL_FILTER 1
 
 // The palette was rescaled to the scene every frame from the raw min and max,
 // the two most noise-sensitive statistics available. Measured unsmoothed, the
@@ -65,6 +77,10 @@ constexpr int MOTION_SHIFT  = 3;    // below it, move 1/(2^n) of the way
 // no per-pixel clamp to pay for.
 constexpr float RANGE_SMOOTH = 0.25f;   // ~0.13s to settle back in at 31fps
 constexpr float RANGE_MARGIN = 1.0f;    // degrees of headroom each side
+// Floor on the palette span. Without it a uniform scene maps 256 colours onto a
+// couple of degrees, so one step is ~8mK and the sensor's own noise fills the
+// palette. Costs contrast on flat scenes, buys a far calmer image.
+constexpr float RANGE_MIN_SPAN = 5.0f;
 // Most the range may move in one frame. A corrupt pixel that still passes the
 // sensor's frame validation can read a few hundred degrees; without this it
 // drags the smoothed endpoint with it, the scene compresses into one end of the
@@ -87,11 +103,20 @@ constexpr float RANGE_OUTLIER_GAP = 6.0f;
 static float notch4[4] = {0, 0, 0, 0};
 #define NOTCH(i) (notch4[(i) & 3])
 
-// Per-column flat field, in degrees, zero-sum so it does not shift absolute
-// temperature. Captured against a uniform target and kept in flash; see
-// flatfield_load(). The sensor shows a fixed left-to-right gradient of a few
-// kelvin that is not thermal self-heating and does not move with the scene.
-static float flatfield[MLX90640_COLUMN_NUM] = {0};
+// Per-pixel flat field, in degrees, zero-sum so it does not shift absolute
+// temperature. Captured against a uniform target and kept in flash.
+// Per pixel rather than per column: with the temporal filter in place, the
+// residual noise on a uniform surface measured ~4 palette steps of flicker
+// against 19-28 steps of fixed pattern, so what is left is almost entirely
+// static per-pixel offset. A per-column field corrects the left-right gradient
+// but none of that.
+static float flatfield[MLX90640_PIXEL_NUM] = {0};
+// values[] with the field removed; CalculateTo only rewrites the current
+// subpage so values[] itself must not be modified
+static float corrected[MLX90640_PIXEL_NUM];
+
+
+
 
 
 #define FLIP_GRAPH_HORIZONTAL 0
@@ -253,7 +278,7 @@ volatile uint8_t g_palette = 0;
 
 #define PERSIST_OFFSET  (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
 #define FLATFIELD_OFFSET (PICO_FLASH_SIZE_BYTES - 2 * FLASH_SECTOR_SIZE)
-constexpr uint32_t FF_MAGIC = 0x31304646;   // "FF01"
+constexpr uint32_t FF_MAGIC = 0x32304646;   // "FF02", per pixel
 #define PERSIST_SLOTS   (FLASH_SECTOR_SIZE / FLASH_PAGE_SIZE)
 constexpr uint8_t  REC_ARMED   = 0xA5;
 constexpr uint8_t  REC_SETTLED = 0x5A;
@@ -315,25 +340,31 @@ static void flatfield_load() {
     if (magic != FF_MAGIC) {
         return;                      // none stored yet
     }
-    for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+    for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
         int16_t mk;
-        memcpy(&mk, p + 4 + 2 * x, sizeof(mk));
-        flatfield[x] = mk * 0.001f;
+        memcpy(&mk, p + 4 + 2 * i, sizeof(mk));
+        flatfield[i] = mk * 0.001f;
     }
 }
 
+// 4 byte magic + 768 int16 millikelvin = 1540 bytes, rounded to whole pages
+#define FF_BYTES (((4 + 2 * MLX90640_PIXEL_NUM) + FLASH_PAGE_SIZE - 1) \
+                  / FLASH_PAGE_SIZE * FLASH_PAGE_SIZE)
+
 static void flatfield_store(const float *field) {
-    static uint8_t page[FLASH_PAGE_SIZE];
-    memset(page, 0xFF, sizeof(page));
+    static uint8_t buf[FF_BYTES];
+    memset(buf, 0xFF, sizeof(buf));
     const uint32_t magic = FF_MAGIC;
-    memcpy(page, &magic, sizeof(magic));
-    for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
-        const int16_t mk = (int16_t)(field[x] * 1000.0f);
-        memcpy(page + 4 + 2 * x, &mk, sizeof(mk));
+    memcpy(buf, &magic, sizeof(magic));
+    for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+        float v = field[i];
+        if (v > 30.0f) v = 30.0f; else if (v < -30.0f) v = -30.0f;
+        const int16_t mk = (int16_t)(v * 1000.0f);
+        memcpy(buf + 4 + 2 * i, &mk, sizeof(mk));
     }
     uint32_t ints = save_and_disable_interrupts();
     flash_range_erase(FLATFIELD_OFFSET, FLASH_SECTOR_SIZE);
-    flash_range_program(FLATFIELD_OFFSET, page, FLASH_PAGE_SIZE);
+    flash_range_program(FLATFIELD_OFFSET, buf, FF_BYTES);
     restore_interrupts(ints);
 }
 
@@ -464,17 +495,51 @@ void renderer() {
                 }
                 gate_primed = true;
             }
+            // convert the threshold into palette steps for this frame's range
+            const float span_mk = (dto->max - dto->min) * 1000.0f;
+            int thresh = (span_mk > 1.0f)
+                       ? (int)(MOTION_THRESH_MK * (float)(HEAT_MAP_SIZE - 1) / span_mk)
+                       : HEAT_MAP_SIZE;
+            if (thresh < 2) thresh = 2;
+
             for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
                 const int target = src[i] << 8;
                 const int cur = (int)gate_state[i];
                 int d = (target - cur) >> 8;
                 if (d < 0) d = -d;
-                gate_state[i] = (uint16_t)((d >= MOTION_THRESH)
+                gate_state[i] = (uint16_t)((d >= thresh)
                                            ? target
                                            : cur + ((target - cur) >> MOTION_SHIFT));
                 gate_out[i] = (uint8_t)(gate_state[i] >> 8);
             }
             src = gate_out;
+        }
+#endif
+
+#if SPATIAL_FILTER
+        {
+            static uint8_t sp_h[MLX90640_PIXEL_NUM], sp_v[MLX90640_PIXEL_NUM];
+            for (int y = 0; y < MLX90640_LINE_NUM; y++) {
+                const uint8_t *r = &src[y * MLX90640_COLUMN_NUM];
+                uint8_t *o = &sp_h[y * MLX90640_COLUMN_NUM];
+                for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+                    const int l = r[x > 0 ? x - 1 : 0];
+                    const int c = r[x];
+                    const int rr = r[x < MLX90640_COLUMN_NUM - 1 ? x + 1 : MLX90640_COLUMN_NUM - 1];
+                    o[x] = (uint8_t)((l + 2 * c + rr + 2) >> 2);
+                }
+            }
+            for (int y = 0; y < MLX90640_LINE_NUM; y++) {
+                const int yu = y > 0 ? y - 1 : 0;
+                const int yd = y < MLX90640_LINE_NUM - 1 ? y + 1 : MLX90640_LINE_NUM - 1;
+                for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
+                    const int u = sp_h[yu * MLX90640_COLUMN_NUM + x];
+                    const int c = sp_h[y  * MLX90640_COLUMN_NUM + x];
+                    const int d = sp_h[yd * MLX90640_COLUMN_NUM + x];
+                    sp_v[y * MLX90640_COLUMN_NUM + x] = (uint8_t)((u + 2 * c + d + 2) >> 2);
+                }
+            }
+            src = sp_v;
         }
 #endif
 
@@ -674,7 +739,8 @@ int main() {
         SSD1351_update();
         sleep_ms(2500);
 
-        float acc[MLX90640_COLUMN_NUM] = {0};
+        static float acc[MLX90640_PIXEL_NUM];
+        memset(acc, 0, sizeof(acc));
         int frames = 0;
         for (int n = 0; n < 128; n++) {
             uint16_t sr = 0;
@@ -684,12 +750,8 @@ int main() {
             if (MLX90640_GetFrameData(MLX_I2C_ADDR, captureFrame) < 0) continue;
             const float eTa = MLX90640_GetTa(captureFrame, params) + OPENAIR_TA_SHIFT;
             MLX90640_CalculateTo_fast(captureFrame, params, EMISSIVITY, eTa, values);
-            for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
-                float col = 0;
-                for (int y = 0; y < MLX90640_LINE_NUM; y++) {
-                    col += values[y * MLX90640_COLUMN_NUM + x];
-                }
-                acc[x] += col * (1.0f / MLX90640_LINE_NUM);
+            for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+                acc[i] += values[i];
             }
             frames++;
         }
@@ -697,9 +759,9 @@ int main() {
         char msg[32];
         if (frames > 16) {
             float mean = 0;
-            for (int x = 0; x < MLX90640_COLUMN_NUM; x++) { acc[x] /= frames; mean += acc[x]; }
-            mean /= MLX90640_COLUMN_NUM;
-            for (int x = 0; x < MLX90640_COLUMN_NUM; x++) acc[x] -= mean;
+            for (int i = 0; i < MLX90640_PIXEL_NUM; i++) { acc[i] /= frames; mean += acc[i]; }
+            mean /= MLX90640_PIXEL_NUM;
+            for (int i = 0; i < MLX90640_PIXEL_NUM; i++) acc[i] -= mean;
             flatfield_store(acc);
             snprintf(msg, sizeof(msg), "saved %d frames", frames);
         } else {
@@ -784,6 +846,14 @@ int main() {
         MLX90640_BadPixelsCorrection(params->outlierPixels, values, patternMode, params);
         PROF_ACC(p_calc, t_calc);
 
+        // Remove the flat field first: everything downstream -- the period-4
+        // notch, the range, the scaling -- must see the same corrected data.
+        // Computing this after the notch left it measuring the previous frame
+        // and subtracting a stale correction, which brought the banding back.
+        for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+            corrected[i] = values[i] - flatfield[i];
+        }
+
 #if NOTCH4
         // Measure the period-4 column component of this frame. At period 4 the
         // basis is cos = 1,0,-1,0 and sin = 0,1,0,-1, so the projection is just
@@ -793,7 +863,7 @@ int main() {
             float cm[MLX90640_COLUMN_NUM];
             for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
                 float acc = 0;
-                for (int y = 0; y < MLX90640_LINE_NUM; y++) acc += values[y * MLX90640_COLUMN_NUM + x];
+                for (int y = 0; y < MLX90640_LINE_NUM; y++) acc += corrected[y * MLX90640_COLUMN_NUM + x];
                 cm[x] = acc * (1.0f / MLX90640_LINE_NUM);
             }
             float c = 0, sn = 0;
@@ -836,7 +906,7 @@ int main() {
         float max1 = -1e30f, max2 = -1e30f, min1 = 1e30f, min2 = 1e30f;
         uint32_t bad = 0;
         for (int i = range_phase; i < MLX90640_PIXEL_NUM; i += 2) {
-            const float value = values[i];
+            const float value = corrected[i];
             // Reject inf/NaN by testing the exponent field directly: a float
             // compare is a soft-float call on this core, and two of them per
             // pixel across 768 pixels is dearer than the rest of the loop.
@@ -875,8 +945,13 @@ int main() {
         // would then stretch the range for that frame and compress the whole
         // scene into the dark end of the palette, which shows as a black frame.
         // Out-of-range pixels are clamped to the end colours instead.
-        const float lo = smin - RANGE_MARGIN;
-        const float hi = smax + RANGE_MARGIN;
+        float lo = smin - RANGE_MARGIN;
+        float hi = smax + RANGE_MARGIN;
+        if (hi - lo < RANGE_MIN_SPAN) {
+            const float mid = 0.5f * (lo + hi);
+            lo = mid - 0.5f * RANGE_MIN_SPAN;
+            hi = mid + 0.5f * RANGE_MIN_SPAN;
+        }
 
         PROF_ACC(p_scale, t_scale);
 
@@ -892,12 +967,12 @@ int main() {
         // nothing in the pixel loop: it is the same single indexed load.
         float off[MLX90640_COLUMN_NUM];
         for (int x = 0; x < MLX90640_COLUMN_NUM; x++) {
-            off[x] = lo + notch4[x & 3] + flatfield[x];
+            off[x] = lo + notch4[x & 3];
         }
         for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
             // clamp in float: casting a non-finite value to int is undefined,
             // and NaN fails both comparisons so it lands on 0
-            const float f = (values[i] - off[i & (MLX90640_COLUMN_NUM - 1)]) * inv_step;
+            const float f = (corrected[i] - off[i & (MLX90640_COLUMN_NUM - 1)]) * inv_step;
             const int idx = (f > 0.0f) ? (f < (float)(HEAT_MAP_SIZE-1) ? (int)f : HEAT_MAP_SIZE-1) : 0;
             dto->values[i] = (uint8_t)idx;
         }

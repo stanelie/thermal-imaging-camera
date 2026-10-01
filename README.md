@@ -68,8 +68,8 @@ Adding them took this camera from 26 to 31 fps and eliminated the errors entirel
 - both cores of the RP2040 in a pipeline:
   - core0 fetches pages from the MLX90640 and scales them to 8-bit indices
   - core1 renders via bilinear interpolation and pushes to the OLED over SPI + DMA
-- **motion-gated noise reduction** — static parts of the image are filtered hard,
-  anything moving follows immediately, so nothing smears
+- **noise reduction** — a per-pixel flat field, a motion-gated temporal filter and
+  a gentle spatial blur, together about an order of magnitude
 - optional plain temporal averaging over N frames (`SMOOTH_FRAMES`, off by default)
 
 ## Using it
@@ -107,23 +107,43 @@ setup. Repeat it if the lens, housing or sensor changes.
 
 ### Noise reduction
 
-The MLX90640 is noisy at 32 Hz: measured on this camera, a static scene varies by
-**about 17 palette steps per pixel per frame**, roughly 660 mK, which matches the
-sensor's expected NETD at this refresh rate.
+Measured on this camera, the noise splits into two parts:
 
-The filter averages each pixel toward its new value by 1/8 per frame, unless the
-pixel changes by more than `MOTION_THRESH`, in which case it follows instantly.
-Still scenes get about a 4x noise reduction; moving subjects are untouched.
+| | |
+| --- | --- |
+| Temporal, per pixel per frame | **~1000 mK** — the sensor's own NETD at 32 Hz |
+| Fixed pattern, after flat fielding | **~200 mK** |
 
-The threshold was set from the measured noise rather than guessed. At 40 steps,
-60-200 pixels per frame crossed it on a *static* scene and snapped through at full
-noise, which sparkles and hides the benefit. At 70 (~3 sigma of the measured
-distribution) a static scene shows single digits. If you change the refresh rate
-or the palette range behaviour, re-measure before re-tuning.
+Three things attack it, in this order:
 
-The filter state is 8.8 fixed point deliberately: with 8-bit state, 1/8 of a small
-difference truncates to zero and the pixel stops tracking altogether, going stale
-rather than clean.
+1. **The per-pixel flat field** removes the fixed part. This was the dominant
+   term before it was captured.
+2. **A motion-gated temporal filter** moves each pixel 1/16 of the way toward its
+   new value per frame, unless it changes by more than `MOTION_THRESH_MK`, where
+   it follows instantly. Still scenes get roughly a 5x reduction; moving subjects
+   do not smear.
+3. **A 1-2-1 spatial blur** on the 32x24 data, worth about another 2.7x. It costs
+   little visible detail because the image is upscaled 4x to the panel with
+   bilinear interpolation anyway.
+
+The gate threshold is in **millikelvin, not palette steps**, and converted per
+frame. This matters: a palette step is not a fixed temperature, because the range
+rescales to the scene. On a wide-range view a step is ~39 mK and the sensor's
+noise is 25 steps; on a uniform wall the range collapses and the same noise
+becomes 125 steps. With a fixed step threshold the filter switched itself off
+exactly where it was needed most.
+
+`RANGE_MIN_SPAN` floors the palette at 5 K for the same reason: without it a
+uniform scene maps 256 colours onto a couple of degrees and the sensor's own noise
+fills the palette no matter how well it is filtered.
+
+The filter state is 8.8 fixed point deliberately: with 8-bit state, a sixteenth of
+a small difference truncates to zero and the pixel stops tracking altogether,
+going stale rather than clean.
+
+Tuning: `MOTION_THRESH_MK` (lower for crisper motion, higher for less noise),
+`MOTION_SHIFT` (higher filters harder but settles slower), `SPATIAL_FILTER` (0
+disables), `RANGE_MIN_SPAN`.
 
 ### What the banner means
 
