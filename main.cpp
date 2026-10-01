@@ -64,6 +64,7 @@ constexpr float RANGE_MAX_JUMP = 12.0f;
 // not believed and the runner-up is used instead.
 constexpr float RANGE_OUTLIER_GAP = 6.0f;
 
+
 // The sensor carries a column pattern of period 4 -- every 4th column shares an
 // ADC channel -- whose amplitude and phase wander at a few Hz. Measured live it
 // averages 1179mK and peaks at 5383mK, while its multi-frame average is only
@@ -195,13 +196,20 @@ struct PaletteDef {
     const RGBColor *stops;
     uint8_t         count;
     const char     *name;
+    // Contrast stretch applied about the midpoint when the lookup table is
+    // built, so it costs nothing per frame. 1.0 is the plain linear ramp;
+    // above that, mid tones spread and the extremes compress toward the end
+    // colours, which clips a little detail at top and bottom in exchange for
+    // more separation where most of the scene sits. The grey palettes take it
+    // best, having no hue to carry information.
+    float           contrast;
 };
 
 constexpr PaletteDef PALETTES[] = {
-    { PAL_RAINBOW,  sizeof(PAL_RAINBOW)  / sizeof(RGBColor), "rainbow" },
-    { PAL_IRON,     sizeof(PAL_IRON)     / sizeof(RGBColor), "iron"    },
-    { PAL_WHITEHOT, sizeof(PAL_WHITEHOT) / sizeof(RGBColor), "white hot" },
-    { PAL_BLACKHOT, sizeof(PAL_BLACKHOT) / sizeof(RGBColor), "black hot" },
+    { PAL_RAINBOW,  sizeof(PAL_RAINBOW)  / sizeof(RGBColor), "rainbow",   1.0f },
+    { PAL_IRON,     sizeof(PAL_IRON)     / sizeof(RGBColor), "iron",      1.0f },
+    { PAL_WHITEHOT, sizeof(PAL_WHITEHOT) / sizeof(RGBColor), "white hot", 1.8f },
+    { PAL_BLACKHOT, sizeof(PAL_BLACKHOT) / sizeof(RGBColor), "black hot", 1.8f },
 };
 constexpr int PALETTE_COUNT = sizeof(PALETTES) / sizeof(PaletteDef);
 
@@ -285,8 +293,12 @@ static uint16_t palette[HEAT_MAP_SIZE];
 void heatmap_init() {
     const RGBColor *colors = PALETTES[g_palette].stops;
     const int numColors = PALETTES[g_palette].count;
+    const float contrast = PALETTES[g_palette].contrast;
     for (int c = 0; c < HEAT_MAP_SIZE; c++) {
-        float value = c * (numColors-1) / float(HEAT_MAP_SIZE-1);
+        float t = c / float(HEAT_MAP_SIZE-1);
+        t = 0.5f + (t - 0.5f) * contrast;
+        if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+        float value = t * (numColors-1);
         int idx1 = int(value);
         uint8_t red, green, blue;
         if (idx1 == value) {
