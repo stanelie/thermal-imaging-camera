@@ -68,7 +68,9 @@ Adding them took this camera from 26 to 31 fps and eliminated the errors entirel
 - both cores of the RP2040 in a pipeline:
   - core0 fetches pages from the MLX90640 and scales them to 8-bit indices
   - core1 renders via bilinear interpolation and pushes to the OLED over SPI + DMA
-- optional temporal smoothing over N frames (`SMOOTH_FRAMES`, disabled by default)
+- **motion-gated noise reduction** — static parts of the image are filtered hard,
+  anything moving follows immediately, so nothing smears
+- optional plain temporal averaging over N frames (`SMOOTH_FRAMES`, off by default)
 
 ## Using it
 
@@ -102,6 +104,26 @@ To correct it, tap the power four times to reach **flat field**, then:
 
 The result is stored in flash and loaded at every boot, so this is a one-time
 setup. Repeat it if the lens, housing or sensor changes.
+
+### Noise reduction
+
+The MLX90640 is noisy at 32 Hz: measured on this camera, a static scene varies by
+**about 17 palette steps per pixel per frame**, roughly 660 mK, which matches the
+sensor's expected NETD at this refresh rate.
+
+The filter averages each pixel toward its new value by 1/8 per frame, unless the
+pixel changes by more than `MOTION_THRESH`, in which case it follows instantly.
+Still scenes get about a 4x noise reduction; moving subjects are untouched.
+
+The threshold was set from the measured noise rather than guessed. At 40 steps,
+60-200 pixels per frame crossed it on a *static* scene and snapped through at full
+noise, which sparkles and hides the benefit. At 70 (~3 sigma of the measured
+distribution) a static scene shows single digits. If you change the refresh rate
+or the palette range behaviour, re-measure before re-tuning.
+
+The filter state is 8.8 fixed point deliberately: with 8-bit state, 1/8 of a small
+difference truncates to zero and the pixel stops tracking altogether, going stale
+rather than clean.
 
 ### What the banner means
 

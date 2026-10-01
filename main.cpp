@@ -45,6 +45,17 @@ constexpr uint16_t HEAT_MAP_SIZE = 256;         // the number of colors in the h
 // temporal average over this many frames, to damp sensor noise. 1 disables it.
 constexpr int SMOOTH_FRAMES = 1;
 
+// Motion-gated temporal filter. Where a pixel is barely changing it is averaged
+// hard, which is where the sensor's noise shows; where it jumps by more than the
+// threshold it follows immediately, so a moving subject does not smear.
+// The state is kept in 8.8 fixed point on purpose: with 8-bit state a 1/4 blend
+// of a small difference truncates to zero and the pixel stops tracking
+// altogether -- it goes stale rather than clean, which looks far worse than the
+// noise it was meant to remove.
+#define MOTION_GATE 1
+constexpr int MOTION_THRESH = 70;   // ~3 sigma of the measured 17-step noise
+constexpr int MOTION_SHIFT  = 3;    // below it, move 1/(2^n) of the way
+
 // The palette was rescaled to the scene every frame from the raw min and max,
 // the two most noise-sensitive statistics available. Measured unsmoothed, the
 // range was rebuilt ~20 times a second and the span wandered over 9..12C, which
@@ -81,6 +92,7 @@ static float notch4[4] = {0, 0, 0, 0};
 // flatfield_load(). The sensor shows a fixed left-to-right gradient of a few
 // kelvin that is not thermal self-heating and does not move with the scene.
 static float flatfield[MLX90640_COLUMN_NUM] = {0};
+
 
 #define FLIP_GRAPH_HORIZONTAL 0
 #define FLIP_GRAPH_VERTICAL 1
@@ -440,6 +452,31 @@ void renderer() {
             }
             src = smoothed;
         }
+
+#if MOTION_GATE
+        {
+            static uint16_t gate_state[MLX90640_PIXEL_NUM];   // 8.8 fixed point
+            static uint8_t  gate_out[MLX90640_PIXEL_NUM];
+            static bool     gate_primed = false;
+            if (!gate_primed) {
+                for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+                    gate_state[i] = (uint16_t)(src[i] << 8);
+                }
+                gate_primed = true;
+            }
+            for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+                const int target = src[i] << 8;
+                const int cur = (int)gate_state[i];
+                int d = (target - cur) >> 8;
+                if (d < 0) d = -d;
+                gate_state[i] = (uint16_t)((d >= MOTION_THRESH)
+                                           ? target
+                                           : cur + ((target - cur) >> MOTION_SHIFT));
+                gate_out[i] = (uint8_t)(gate_state[i] >> 8);
+            }
+            src = gate_out;
+        }
+#endif
 
         // integer bilinear interpolation off the precomputed tables
         for (int y = 0; y < GRAPH_HEIGHT; y++) {
