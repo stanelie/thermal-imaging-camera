@@ -63,12 +63,58 @@ Adding them took this camera from 26 to 31 fps and eliminated the errors entirel
   delivers a subpage every 31.25 ms and the pipeline now keeps up with it, so the
   camera is paced by the sensor rather than by its own work
 - **53 ms** end-to-end latency, sensor-ready to pixels lit
-- **82 ms** boot to first frame
+- four palettes and a flat-field calibration, selected without any buttons
+- per-frame removal of the sensor's period-4 column banding
 - both cores of the RP2040 in a pipeline:
   - core0 fetches pages from the MLX90640 and scales them to 8-bit indices
   - core1 renders via bilinear interpolation and pushes to the OLED over SPI + DMA
-- configurable heat map
 - optional temporal smoothing over N frames (`SMOOTH_FRAMES`, disabled by default)
+
+## Using it
+
+There are no buttons on this build. **The control is a short power cycle:** switch
+the camera off and back on again *while the splash screen is still showing* (about
+one second). Each tap advances to the next mode, and the splash names it:
+
+```
+rainbow  ->  iron  ->  white hot  ->  black hot  ->  flat field  ->  rainbow ...
+```
+
+A normal power-off, after the splash has gone, changes nothing. The selection is
+kept in flash and survives being switched off.
+
+### Capturing a flat field
+
+The sensor has a fixed left-to-right gradient — on this unit, 2.16 K from one edge
+to the other. It is not the scene and not self-heating: it is present from a cold
+start and stays with the display when the camera is rotated.
+
+To correct it, tap the power four times to reach **flat field**, then:
+
+1. The screen shows `fill view, hold` and waits 2.5 s.
+2. Put something uniform right in front of the lens so it fills the whole view — a
+   sheet of card a few centimetres away works well. **Do not use a distant wall**,
+   which is rarely uniform in the infrared; whatever unevenness it has is baked
+   permanently into the correction.
+3. Hold still for about 4 s while it averages 128 frames.
+4. It reports `saved N frames` and returns to the rainbow palette with the
+   correction applied.
+
+The result is stored in flash and loaded at every boot, so this is a one-time
+setup. Repeat it if the lens, housing or sensor changes.
+
+### What the banner means
+
+The bottom strip shows the coldest and hottest temperature in view, and the frame
+rate. Extra letters appear only when something is wrong:
+
+| | |
+| --- | --- |
+| `B` | pixels in this frame whose value was not a finite number |
+| `T` | EEPROM reads needed at boot before the calibration extracted (normally 1, not shown) |
+
+Frame read failures are not shown: they skip a frame, which is invisible, and are
+reported over USB serial instead.
 
 ## Differences from upstream
 
@@ -80,14 +126,37 @@ Beyond the pin remapping and pull-ups above:
 | Frame buffers released after the SPI push, not before | latency 118 → 86 ms |
 | SPI clock 10 → 16 MHz, framebuffer pushed by DMA | SPI 34.9 → 19.9 ms |
 | Text banner refreshed ~3×/s instead of every frame | SPI 19.9 → 15.4 ms |
-| Sensor probed at boot instead of a fixed 540 ms sleep | boot 597 → 82 ms |
+| Sensor probed and its EEPROM verified at boot, instead of a fixed 540 ms sleep | sensor bring-up 597 → 82 ms; the splash then holds for 1 s as the mode-select window |
 | Image rendered at a true 4:3 128×96, centred | upstream stretched it vertically |
 | Interpolation tables use a `DST-1` denominator | the outermost sensor row and column reached only 27% and 76% weight before |
 | Image orientation corrected | upstream's flip settings are 180° out on this build |
 | Touch buttons removed | the pins are unwired here; left floating with edge interrupts they trip at random |
+| Palettes, flat field and the power-tap control | see [Using it](#using-it) |
+| Period-4 column banding removed per frame | the sensor's own artefact, 1179 mK typical; see below |
+| Palette range smoothed instead of rebuilt each frame | the old code rescaled ~20 times a second from the raw min/max |
 
 Upstream's own measurements were 23 fps on a Pico; the 21 fps baseline this fork
 started from was measured on this hardware, as were all the figures above.
+
+### The column banding
+
+The sensor carries a fixed-pattern artefact whose period is **exactly 4 columns**,
+consistent with columns sharing readout channels in a repeating cycle of four. It
+survives switching the sensor between chess and interleaved readout, so it is not a
+scan-pattern effect.
+
+Measured live it averages **1179 mK per frame and peaks at 5383 mK**, but its phase
+wanders at 3.8–5.4 Hz, so a 36-frame average sees only 367 mK. That is why a static
+correction does nothing — it cancels itself out. The fix measures the component
+fresh every frame (two numbers: the cosine and sine amplitude at period 4) and
+subtracts it. Two degrees of freedom at exactly a 4-column pitch, which real scenes
+essentially never contain.
+
+An adaptive 32-column correction was tried first and **destroyed the image**: with
+that many degrees of freedom it cannot distinguish the sensor's pattern from
+persistent vertical structure in the scene. The same reasoning is why the flat
+field is captured once against a known uniform target rather than estimated
+continuously.
 
 Why single precision: upstream calls the Melexis driver's `MLX90640_CalculateTo`,
 which is written against double literals (`SCALEALPHA` is `0.000001`, the Kelvin
@@ -117,6 +186,14 @@ computes the identical expressions in `float`.
 
 Flash `build/thermocam.uf2` by holding BOOTSEL while connecting USB and copying it
 to the RPI-RP2 drive, or with `picotool load -x build/thermocam.uf2`.
+
+The top two flash sectors hold persistent settings and are not part of the
+program: the last one logs the selected mode, the one below it stores the flat
+field. Both survive reflashing, so a new build keeps your calibration.
+
+Tuning constants are grouped at the top of `main.cpp`: `SETTLE_US` (splash length
+and mode-select window), `SMOOTH_FRAMES`, `RANGE_SMOOTH`, `RANGE_OUTLIER_GAP` and
+the per-palette `contrast` in `PALETTES[]`.
 
 `PROFILE` in `main.cpp` (on by default) prints per-stage timings over USB serial
 once a second, which is how every number above was measured.
