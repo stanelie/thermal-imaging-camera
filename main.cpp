@@ -136,6 +136,8 @@ static void interp_tables_init() {
 static repeating_timer_t timer;
 static int frame_cnt = 0;
 volatile uint32_t g_sensor_errors = 0;   // shown in the banner; no serial on battery
+volatile uint32_t g_bad_pixels = 0;      // non-finite values seen in the last frame
+volatile int      g_ee_tries   = 1;      // EEPROM reads needed before parameters extracted
 static int fps = 0;
 
 bool timer_callback(repeating_timer_t *rt)
@@ -427,9 +429,11 @@ void renderer() {
             sprintf(buf, "%.0f", min);
             SSD1351_text(1, y, buf, WHITE);
 
-            if (g_sensor_errors) {
-                sprintf(buf, "%d fps E%lu", fps, (unsigned long)g_sensor_errors);
-            } else {
+            int n = sprintf(buf, "%d", fps);
+            if (g_sensor_errors) n += sprintf(buf + n, " E%lu", (unsigned long)g_sensor_errors);
+            if (g_bad_pixels)    n += sprintf(buf + n, " B%lu", (unsigned long)g_bad_pixels);
+            if (g_ee_tries > 1)  n += sprintf(buf + n, " T%d", g_ee_tries);
+            if (n == (int)strlen(buf) && !g_sensor_errors && !g_bad_pixels && g_ee_tries <= 1) {
                 sprintf(buf, "%d fps", fps);
             }
             int w = SSD1351_textwidth(buf);
@@ -523,10 +527,20 @@ int main() {
     const uint32_t t_boot_cfg = time_us_32();
 
     uint16_t *eeMLX90640 = new uint16_t[832];       // too large for allocating on stack
-    int ee_err = MLX90640_DumpEE(MLX_I2C_ADDR, eeMLX90640);
-    const uint32_t t_boot_ee = time_us_32();
     paramsMLX90640 *params = new paramsMLX90640;    // too large for allocating on stack
-    int pe_err = MLX90640_ExtractParameters(eeMLX90640, params);
+
+    // An I2C ack only proves the sensor's interface is alive, not that its
+    // EEPROM is readable yet. Rather than guess at a settling delay, read it and
+    // check that the parameters extract cleanly; retry if they do not.
+    int ee_err = 0, pe_err = 0, ee_tries = 0;
+    for (ee_tries = 1; ee_tries <= 8; ee_tries++) {
+        ee_err = MLX90640_DumpEE(MLX_I2C_ADDR, eeMLX90640);
+        pe_err = MLX90640_ExtractParameters(eeMLX90640, params);
+        if (pe_err == 0) break;
+        sleep_ms(150);
+    }
+    g_ee_tries = ee_tries;
+    const uint32_t t_boot_ee = time_us_32();
     const uint32_t t_boot_params = time_us_32();
     delete eeMLX90640;
 
@@ -542,7 +556,7 @@ int main() {
         char line[40];
         SSD1351_clear();
         SSD1351_text(2, 40, (char*)"sensor fault", WHITE);
-        snprintf(line, sizeof(line), "ack%d ee%d par%d", sensor_ack ? 1 : 0, ee_err, pe_err);
+        snprintf(line, sizeof(line), "ack%d ee%d par%d t%d", sensor_ack ? 1 : 0, ee_err, pe_err, ee_tries);
         SSD1351_text(2, 56, line, WHITE);
         SSD1351_update();
         sleep_ms(4000);
@@ -551,10 +565,10 @@ int main() {
     FrameDTO *dto = NULL;   // held across iterations so a skipped frame never loses it
     snprintf(p_boot_line, sizeof(p_boot_line),
              "boot (ms from power-on): stdio=%lu core1=%lu sensorcfg=%lu dumpEE=%lu"
-             " params=%lu loop=%lu  [sensorACK=%lu EE->%d params->%d mode=%d]",
+             " params=%lu loop=%lu  [sensorACK=%lu EE->%d params->%d tries=%d mode=%d]",
              t_boot_stdio/1000, t_boot_core1/1000, t_boot_cfg/1000,
              t_boot_ee/1000, t_boot_params/1000, time_us_32()/1000,
-             (t_boot_ack - probe_us)/1000, ee_err, pe_err, patternMode);
+             (t_boot_ack - probe_us)/1000, ee_err, pe_err, ee_tries, patternMode);
     printf("%s\n", p_boot_line);
 
 
@@ -657,13 +671,22 @@ int main() {
         // find min and max temperature values of the frame
         PROF_T(t_scale);
         float min, max;
-        min = max = values[0];
-        for (int i = 1; i < MLX90640_PIXEL_NUM; i++) {
-            float value = values[i];
-            if (value > max)
-                max = value;
-            if (value < min)
-                min = value;
+        // A single non-finite pixel must not be allowed near the range: min is
+        // smoothed, so one -inf pins smin at -inf for good, which makes step
+        // infinite and every index NaN -- a permanently black image while the
+        // max readout still tracks the scene. Range-check rather than isfinite:
+        // NaN fails both comparisons, so it is skipped too.
+        min = 1e30f; max = -1e30f;
+        uint32_t bad = 0;
+        for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
+            const float value = values[i];
+            if (!(value > -1000.0f && value < 5000.0f)) { bad++; continue; }
+            if (value > max) max = value;
+            if (value < min) min = value;
+        }
+        g_bad_pixels = bad;
+        if (bad == MLX90640_PIXEL_NUM) {   // nothing usable this frame
+            min = 0.0f; max = 1.0f;
         }
 
 
@@ -695,8 +718,10 @@ int main() {
         const float off[4] = { lo + notch4[0], lo + notch4[1],
                                lo + notch4[2], lo + notch4[3] };
         for (int i = 0; i < MLX90640_PIXEL_NUM; i++) {
-            int idx = (int)((values[i] - off[i & 3]) * inv_step);
-            if (idx < 0) idx = 0; else if (idx > HEAT_MAP_SIZE-1) idx = HEAT_MAP_SIZE-1;
+            // clamp in float: casting a non-finite value to int is undefined,
+            // and NaN fails both comparisons so it lands on 0
+            const float f = (values[i] - off[i & 3]) * inv_step;
+            const int idx = (f > 0.0f) ? (f < (float)(HEAT_MAP_SIZE-1) ? (int)f : HEAT_MAP_SIZE-1) : 0;
             dto->values[i] = (uint8_t)idx;
         }
         PROF_ACC(p_scale, t_scale2);
