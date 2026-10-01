@@ -146,7 +146,6 @@ static repeating_timer_t timer;
 static int frame_cnt = 0;
 volatile uint32_t g_bad_pixels = 0;      // non-finite values seen in the last frame
 volatile int      g_ee_tries   = 1;      // EEPROM reads needed before parameters extracted
-volatile uint32_t g_range_spikes = 0;    // frames whose min/max jumped implausibly
 static int fps = 0;
 
 bool timer_callback(repeating_timer_t *rt)
@@ -440,9 +439,8 @@ void renderer() {
 
             int n = sprintf(buf, "%d", fps);
             if (g_bad_pixels)    n += sprintf(buf + n, " B%lu", (unsigned long)g_bad_pixels);
-            if (g_range_spikes)  n += sprintf(buf + n, " S%lu", (unsigned long)g_range_spikes);
             if (g_ee_tries > 1)  n += sprintf(buf + n, " T%d", g_ee_tries);
-            if (!g_bad_pixels && !g_range_spikes && g_ee_tries <= 1) {
+            if (!g_bad_pixels && g_ee_tries <= 1) {
                 sprintf(buf, "%d fps", fps);
             }
             int w = SSD1351_textwidth(buf);
@@ -726,8 +724,8 @@ int main() {
         }
         // feed the smoothing a rate-limited view of this frame's endpoints
         float mn = min, mx = max;
-        if (mx > smax + RANGE_MAX_JUMP) { mx = smax + RANGE_MAX_JUMP; g_range_spikes++; }
-        if (mn < smin - RANGE_MAX_JUMP) { mn = smin - RANGE_MAX_JUMP; g_range_spikes++; }
+        if (mx > smax + RANGE_MAX_JUMP) mx = smax + RANGE_MAX_JUMP;
+        if (mn < smin - RANGE_MAX_JUMP) mn = smin - RANGE_MAX_JUMP;
         smin += (mn - smin) * RANGE_SMOOTH;
         smax += (mx - smax) * RANGE_SMOOTH;
         // Deliberately NOT widened to the raw min/max: a single outlier pixel
